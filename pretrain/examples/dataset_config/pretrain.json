@@ -3,7 +3,7 @@
     "sources": "../output/split_data_pretrain/file_list.json",
     "only_assistant_loss": false,
     "max_length": 30000,
-    "base_model_dir": "/code/hf_models/Qwen3-1.7B_itemic",
+    "base_model_dir": "/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/data/code/onerec_pretrain/hf_models/Qwen3-0.6B_itemic",
     "num_workers": 2,
     "num_epochs": 4,
     "cut_to_pad": 1,

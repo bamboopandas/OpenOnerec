@@ -4,10 +4,10 @@
 set -e
 
 # Configuration
-# Both general and onerec use datasets starting with sft
-GENERAL_TEXT_PATH="../raw_data/general_text/sft"
-REC_DATA_PATH="../output/onerec_sft"
-OUTPUT_DIR="../output/split_data_sft"
+# Both general and onerec use datasets starting with pretrain
+GENERAL_TEXT_PATH="../raw_data/general_text/pretrain"
+REC_DATA_PATH="../raw_data/onerec_data"
+OUTPUT_DIR="../output/split_data_pretrain"
 MAX_ROWS=1000
 ENGINE="pyarrow"
 

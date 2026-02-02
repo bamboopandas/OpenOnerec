@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# Set common variables
+MODEL_PATH=$1
+VERSION="${VERSION:-v9.0_false_RAG_id_v3_test}"
+ENABLE_THINKING=$3
+CUSTOM_DATA_DIR=$4
+
+# Read configuration from environment variables (set by eval_script.py)
+# Fallback to hardcoded paths if not set
+BENCHMARK_BASE_DIR="${BENCHMARK_BASE_DIR:-.}"
+DATA_VERSION="${DATA_VERSION:-v1.0}"
+
+BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}"
+BASE_LOG_NAME="${BENCHMARK_BASE_DIR}/auto_eval_logs/${VERSION}/$2"
+
+if [ -n "$CUSTOM_DATA_DIR" ]; then
+    BENCHMARK_DATA_DIR="$CUSTOM_DATA_DIR"
+else
+    BENCHMARK_DATA_DIR="${BENCHMARK_DATA_DIR:-${BENCHMARK_BASE_DIR}/data_${DATA_VERSION}}"
+fi
+DATA_DIR="$BENCHMARK_DATA_DIR"
+
+# Create output directory and log directory
+mkdir -p "$(dirname "${BASE_LOG_NAME}")"
+mkdir -p "$BASE_OUTPUT_DIR"
+
+# Write debug info to log file
+{
+    echo "========== Task Configuration =========="
+    echo "DATA_DIR: $DATA_DIR"
+    echo "Enable Thinking: $ENABLE_THINKING"
+    echo "========================================"
+} >> "${BASE_LOG_NAME}.log"
+
+# Build thinking arguments
+THINKING_ARGS=""
+if [ "$ENABLE_THINKING" = "true" ]; then
+    THINKING_ARGS="--enable_thinking"
+fi
+
+echo "Thinking args: $THINKING_ARGS"
+
+export PYTHONPATH="${BENCHMARK_BASE_DIR}:$PYTHONPATH"
+
+echo "Running all tasks"
+
+PYTHON_EXEC="/home/lkzhang/miniconda3/envs/openonerec/bin/python3"
+
+# Task: ad
+$PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
+    --num_gpus 1 \
+    --gpu_ids 1 \
+    --task_types ad \
+    --gpu_memory_utilization 0.8 \
+    --model_path "$MODEL_PATH" \
+    --data_dir "$DATA_DIR" \
+    --output_dir "${BASE_OUTPUT_DIR}" \
+    --dtype bfloat16 --max_model_len 8192 \
+    --worker_batch_size 1875 \
+    --overwrite \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
+
+echo "All tasks completed successfully"

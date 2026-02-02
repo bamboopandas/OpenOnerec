@@ -421,16 +421,28 @@ def initialize_distributed() -> Tuple[int, int, int]:
     Returns:
         Tuple of (rank, world_size, local_rank)
     """
-    rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", 0))
-    world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", 0))
-    local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", 0))
+    # Try standard torch distributed environment variables first (set by torchrun)
+    if "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        # Fallback to OpenMPI variables
+        rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", 0))
+        world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", 0))
+        local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", 0))
     
     torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(
-        rank=rank,
-        world_size=world_size,
-        timeout=PROCESS_GROUP_TIMEOUT
-    )
+    
+    # If world_size is 0, let init_process_group read from env or default
+    init_kwargs = {
+        "timeout": PROCESS_GROUP_TIMEOUT
+    }
+    if world_size > 0:
+        init_kwargs["rank"] = rank
+        init_kwargs["world_size"] = world_size
+        
+    torch.distributed.init_process_group(**init_kwargs)
     
     return rank, world_size, local_rank
 
@@ -455,7 +467,7 @@ def initialize_model(
     # Create model on meta device
     with set_default_dtype(torch.bfloat16), torch.device("meta"), init_empty_weights():
         config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
-        config._attn_implementation = "flash_attention_2"
+        config._attn_implementation = "sdpa"
         config.use_cache = False
         config.chunked_loss_computer = args.use_chunked_loss_computer
         model = eval(args.model_class)(config)

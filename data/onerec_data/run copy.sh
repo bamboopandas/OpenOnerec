@@ -14,13 +14,14 @@ RUN_PRETRAIN_ITEM_UNDERSTAND=1
 
 # SFT tasks
 RUN_SFT_VIDEO_REC=1
-RUN_SFT_INTERACTIVE_REC=0
-RUN_SFT_LABEL_COND_REC=0
-RUN_SFT_LABEL_PRED=0
-RUN_SFT_AD_REC=0
-RUN_SFT_PRODUCT_REC=0
-RUN_SFT_ITEM_UNDERSTAND=1
-RUN_SFT_REC_REASON=0
+RUN_SFT_INTERACTIVE_REC=1
+RUN_SFT_LABEL_COND_REC=1
+RUN_SFT_LABEL_PRED=1
+RUN_SFT_AD_REC=1
+RUN_SFT_PRODUCT_REC=1
+RUN_SFT_SID2CAPTION=1
+RUN_SFT_RECO_REASON=1
+RUN_SFT_REC_REASON=1
 
 # ============== Configuration ==============
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,9 +42,7 @@ run_task() {
     shift 3
     local extra_args="$@"
 
-    local output_dir="${OUTPUT_BASE_DIR}/onerec_${task_type}"
-    mkdir -p "${output_dir}"
-    local output_file="${output_dir}/${task_name}.parquet"
+    local output_file="${OUTPUT_BASE_DIR}/${task_type}_${task_name}.parquet"
     local temp_dir=$(mktemp -d)
 
     echo "  Output: ${output_file}"

@@ -39,6 +39,7 @@ class InfrastructureConfig:
         metadata={"help": "Number of GPUs to use (default uses all visible GPUs)"}
     )
     gpu_ids: Optional[List[int]] = field(
+        # default=[1],
         default=None,
         metadata={"help": "List of GPU IDs to use (e.g., [0,2,4], default uses all visible GPUs)"}
     )

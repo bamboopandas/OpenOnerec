@@ -74,7 +74,7 @@ def load_parquet_file(
     file_path: str,
     retry: int = 5,
     max_cache_files: int = 500,
-    parquet_backend: str = 'fast_parquet',
+    parquet_backend: str = 'pyarrow',
     cache_dir: Optional[str] = None,
     hadoop_cmd: Optional[str] = None
 ) -> pq.ParquetFile:

@@ -40,7 +40,13 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils.generic import LossKwargs, can_return_tuple
+from transformers.utils.generic import can_return_tuple
+try:
+    from transformers.utils.generic import LossKwargs
+except ImportError:
+    from typing import TypedDict
+    class LossKwargs(TypedDict, total=False):
+        pass
 from transformers.utils.doc import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
 from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg

@@ -470,6 +470,7 @@ class Qwen3ChatCompletionDataset(IterableDataset):
         cur_length = 0
         ds_iter = iter(self.dataset)
         while True:
+            source_name = "None"
             try:
                 sample = next(ds_iter)
                 sample_key = sample["__key__"] if "__key__" in sample else ""
@@ -487,8 +488,11 @@ class Qwen3ChatCompletionDataset(IterableDataset):
             except:
                 self.source_error_cnt.setdefault(source_name, 0)
                 self.source_error_cnt[source_name] += 1
-                error_ratio = self.source_error_cnt[source_name] * 1.0 / \
-                    self.source_sample_cnt[source_name]
+                if source_name in self.source_sample_cnt:
+                    error_ratio = self.source_error_cnt[source_name] * 1.0 / \
+                        self.source_sample_cnt[source_name]
+                else:
+                    error_ratio = 1.0
                 
                 rank, world_size, worker, num_workers = pytorch_worker_info()
                 logger.error(
@@ -580,7 +584,8 @@ class Qwen3NaiveParquetDataset(IterableDataset):
             elif messages is not None and isinstance(messages, np.ndarray):
                 sample_data["messages"] = messages.tolist()
             else:
-                raise NotImplementedError(f"Unsupported sample, message type is {type(messages)}, message={messages}, segments type is {type(segments)}, segments={segments}")
+                logger.warning(f"Skipping unsupported sample: uuid={key}, source={data_source}, msg_type={type(messages)}, seg_type={type(segments)}")
+                return None
 
             samples["json"] = sample_data
             
@@ -638,6 +643,8 @@ class Qwen3NaiveParquetDataset(IterableDataset):
             finish_dict[key] |= sample_bit
 
             sample = self._parser(row, row['__fn__'])
+            if sample is None:
+                continue
             sample['epoch_idx'] = torch.tensor(row['epoch_idx'])
             yield sample
 

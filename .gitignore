@@ -67,10 +67,16 @@ checkpoints/
 ckpt/
 
 # Data
-# *.parquet
-# *.csv
-# *.json
-# *.jsonl
+raw_data/
+benchmarks/results/
+data/code/
+*.parquet
+*.csv
+*.jsonl
+*.txt
+!openonerec.txt
+!README_ours.md
+!requirements.txt
 
 # Ray
 ray_results/
