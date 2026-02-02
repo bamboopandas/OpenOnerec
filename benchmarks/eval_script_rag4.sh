@@ -1,4 +1,6 @@
 #!/bin/bash
+# bash eval_script_rag4_true.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000
+
 
 # Set common variables
 MODEL_PATH=$1
