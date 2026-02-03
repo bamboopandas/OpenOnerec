@@ -70,18 +70,27 @@ import json
 import pprint
 
 # Load the processed file
+file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_raganswersummary_v2/video/video_test.parquet'
 # file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_raganswersummary/product/product_test.parquet'
-file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_raganswersummary/ad/ad_test.parquet'
+# file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_raganswersummary/ad/ad_test.parquet'
 df = pd.read_parquet(file_path)
 
 # Take the first row
-row = df.iloc[19].to_dict()
+for i in range (20):
+    row = df.iloc[i].to_dict()
 
-# Convert JSON strings to objects for clear printing
-if 'metadata' in row and isinstance(row['metadata'], str):
-    row['metadata'] = json.loads(row['metadata'])
-if 'messages' in row and isinstance(row['messages'], str):
-    row['messages'] = json.loads(row['messages'])
+    # Convert JSON strings to objects for clear printing
+    if 'metadata' in row and isinstance(row['metadata'], str):
+        row['metadata'] = json.loads(row['metadata'])
+    if 'messages' in row and isinstance(row['messages'], str):
+        row['messages'] = json.loads(row['messages'])
 
-# Use pprint to display the entire structure clearly
-pprint.pprint(row, sort_dicts=False, width=120)
+    # Use pprint to display the entire structure clearly
+    pprint.pprint(row, sort_dicts=False, width=120)
+
+    # --- 新增判定部分 ---
+    user_input = input("\n回车继续查看下一条，输入 'q' 退出: ").strip().lower()
+    if user_input == 'q':
+        print("已退出循环。")
+        break
+    print("-" * 40) # 打印分割线，方便区分每一条数据

@@ -5,11 +5,13 @@ import numpy as np
 from tqdm import tqdm
 from collections import defaultdict, Counter
 import re
+import math
+import random
 
 # ================= Configuration =================
 SOURCE_TRAIN_PATH = "raw_data/onerec_data/onerec_bench_release.parquet"
 BENCHMARK_BASE_DIR = "raw_data/onerec_data/benchmark_data_1000"
-OUTPUT_BASE_DIR = "raw_data/onerec_data/benchmark_data_1000_test_raganswersummary"
+OUTPUT_BASE_DIR = "raw_data/onerec_data/benchmark_data_1000_test_raganswersummary_v2"
 CAPTION_PATH = "raw_data/onerec_data/pid2caption.parquet"
 
 # RAG Configuration
@@ -32,15 +34,21 @@ STOP_WORDS = {
     '让', '到', '往', '但', '但是', '因为', '所以', '如果', '我们', '你们', '他们', 
     '自己', '大家', '由于', '提供', '有限', '具体', '未知', '无法', '针对', '进行', 
     '压缩', '总结', '信息', '介绍', '分享', '包含', '其中', '以及', '非常', '十分',
-    '通过', '观众', '一种', '一样', '一旦', '一直', '一些', '一切'
+    '通过', '观众', '一种', '一样', '一旦', '一直', '一些', '一切',
+    # Added common artifacts and generic terms
+    '视频中', '画面', '兴趣', '生活', '相关', '部分', '点击', '链接', '详情', 
+    '查看', '更多', '商品', '产品', '推荐', '物品', '东西', '事物', '可能', 
+    '涉及', '主题', '感觉', '觉得', '认为', '使用', '利用', '喜欢', '喜爱'
 }
 
 # 2. Structural Stop Chars/Words (N-grams cannot START or END with these)
-# e.g. "是一个" starts with "是" -> Filtered. "的视频" starts with "的" -> Filtered.
 STRUCTURAL_STOPS = {
     '的', '了', '是', '在', '和', '与', '或', '对', '将', '以', '这', '那', '有', 
     '个', '为', '被', '从', '到', '让', '给', '去', '来', '把', '又', '也', '很',
-    '但', '都', '要', '会', '能', '好', '看', '做', '用', '及', '其', '于'
+    '但', '都', '要', '会', '能', '好', '看', '做', '用', '及', '其', '于',
+    # Added positionals and classifiers
+    '中', '上', '下', '里', '内', '外', '旁', '边', '前', '后', 
+    '位', '款', '种', '项', '类', '群', '些', '点', '次', '回', '名'
 }
 
 # ================= Helper Classes & Functions =================
@@ -53,8 +61,8 @@ def load_captions(path):
     df = pd.read_parquet(path)
     return dict(zip(df['pid'], df['dense_caption']))
 
-def get_ngrams(text, n_list=[2, 3, 4, 5, 6]):
-    """Extracts n-grams from cleaned text, supporting longer entities."""
+def get_ngrams(text, n_list=[2, 3, 4]):
+    """Extracts n-grams from cleaned text."""
     # Keep chinese, numbers, and english letters
     text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text)
     grams = []
@@ -72,61 +80,81 @@ def is_valid_ngram(gram):
         return False
     
     # Check boundaries (Start/End)
-    # Get first char/word logic roughly by checking first character for Chinese
     if gram[0] in STRUCTURAL_STOPS or gram[-1] in STRUCTURAL_STOPS:
         return False
     
-    # Check if it contains ONLY stop words (rough check)
-    # e.g. "这是一个" -> "这", "是", "一个" are all stops.
-    # But usually boundary check catches "是一个" (starts with 是).
-    
+    # Heuristic: If > 50% of the string corresponds to stop-chars/words, drop it.
+    stop_char_count = sum(1 for c in gram if c in STRUCTURAL_STOPS or c in STOP_WORDS)
+    if stop_char_count / len(gram) > 0.5:
+        return False
+
     return True
 
-def filter_redundant_terms(counter, threshold_ratio=1.2):
+class IDFCalculator:
+    def __init__(self, caption_map, sample_size=50000):
+        self.doc_freq = defaultdict(int)
+        self.total_docs = 0
+        self.compute_idf(caption_map, sample_size)
+
+    def compute_idf(self, caption_map, sample_size):
+        print(f"Computing global IDF from sample of {sample_size} captions...")
+        all_pids = list(caption_map.keys())
+        if len(all_pids) > sample_size:
+            sampled_pids = random.sample(all_pids, sample_size)
+        else:
+            sampled_pids = all_pids
+        
+        self.total_docs = len(sampled_pids)
+        
+        for pid in tqdm(sampled_pids, desc="IDF Build"):
+            text = caption_map[pid]
+            grams = set(get_ngrams(text, [2, 3, 4])) # Use set to count DF (once per doc)
+            for g in grams:
+                if is_valid_ngram(g):
+                    self.doc_freq[g] += 1
+        
+        print(f"IDF computed for {len(self.doc_freq)} terms.")
+
+    def get_score(self, term):
+        # IDF = log(N / (df + 1))
+        df = self.doc_freq.get(term, 0)
+        # Smooth IDF: +1 to avoid division by zero (though df+1 handles it)
+        # Using base 10 log
+        return math.log10((self.total_docs + 1) / (df + 1))
+
+def filter_redundant_terms(scored_terms, top_k=3):
     """
-    Filters out terms that are substrings of longer terms with similar frequency.
-    Ex: 'Doubao AI' (10) vs 'Doubao AI Assistant' (10) -> Keep longer.
+    Selects top terms that are not too similar to each other.
+    scored_terms: list of (term, score), sorted by score desc.
     """
-    # Sort by Length DESCENDING (Longest first)
-    items = list(counter.items())
-    # Sort primarily by length (desc), secondary by freq (desc)
-    items.sort(key=lambda x: (len(x[0]), x[1]), reverse=True)
+    final_terms = []
     
-    final_terms = {}
-    
-    # Check each term against valid longer terms found so far? 
-    # No, we need to check against ALL terms.
-    
-    sorted_by_freq = sorted(items, key=lambda x: x[1], reverse=True)
-    # Limit to top candidate pool to avoid O(N^2) on huge lists
-    candidates = sorted_by_freq[:60] 
-    
-    candidate_map = dict(candidates)
-    
-    processed_terms = set()
-    
-    # Iterate through candidates. Since we want to KEEP the best, 
-    # we can just iterate and see if it is a substring of another "better" candidate.
-    
-    for term, count in candidates:
-        is_redundant = False
-        for other, other_count in candidates:
-            if term == other: continue
+    for term, score in scored_terms:
+        if len(final_terms) >= top_k:
+            break
             
-            # If term is inside other (e.g. "Peace" in "Peace Elite")
-            if term in other:
-                # If "Peace" freq is not much higher than "Peace Elite", 
-                # it means "Peace" rarely appears alone.
-                if count <= other_count * threshold_ratio:
-                    is_redundant = True
-                    break
+        is_redundant = False
+        for existing in final_terms:
+            # Check substrings
+            if term in existing or existing in term:
+                is_redundant = True
+                break
+            
+            # Check overlap (Jaccard-ish for characters)
+            set_a = set(term)
+            set_b = set(existing)
+            overlap = len(set_a.intersection(set_b))
+            union = len(set_a.union(set_b))
+            if overlap / union > 0.6: # High character overlap
+                is_redundant = True
+                break
         
         if not is_redundant:
-            final_terms[term] = count
+            final_terms.append(term)
             
-    return Counter(final_terms)
+    return final_terms
 
-def summarize_commonality(pids, caption_map):
+def summarize_commonality(pids, caption_map, idf_calc):
     if not pids: return ""
     captions = []
     for pid in pids:
@@ -138,17 +166,36 @@ def summarize_commonality(pids, caption_map):
     
     if not captions: return ""
 
-    counter = Counter()
+    # TF Counting
+    tf_counter = Counter()
     for cap in captions:
-        grams = get_ngrams(cap, [2, 3, 4, 5, 6]) # Longer n-grams
+        grams = get_ngrams(cap, [2, 3, 4]) 
         for g in grams:
             if is_valid_ngram(g):
-                counter[g] += 1
+                tf_counter[g] += 1
                 
-    if not counter: return ""
+    if not tf_counter: return ""
 
-    refined_counter = filter_redundant_terms(counter)
-    common_terms = [item[0] for item in refined_counter.most_common(3)]
+    # TF-IDF Scoring
+    scored_terms = []
+    for term, tf in tf_counter.items():
+        # Heuristic: Boost terms that appear in multiple DIFFERENT retrieved items
+        # But get_ngrams can return same term multiple times per doc.
+        # Here tf is total freq.
+        # Ideally we want (Document Frequency in Retrieved Set) * IDF
+        # But straightforward TF*IDF is fine for summary.
+        
+        idf = idf_calc.get_score(term)
+        score = tf * idf
+        scored_terms.append((term, score))
+    
+    # Sort by Score DESC
+    scored_terms.sort(key=lambda x: x[1], reverse=True)
+    
+    # Take candidates for diversity filtering
+    candidates = scored_terms[:50] 
+    
+    common_terms = filter_redundant_terms(candidates, top_k=3)
     
     if not common_terms: return ""
         
@@ -159,7 +206,7 @@ class InvertedIndex:
     def __init__(self, name):
         self.name = name
         self.index = defaultdict(list)
-        self.user_data = {} 
+        self.user_data = {}
         self.user_tokens = {}
 
     def add_users(self, df, hist_col, target_col):
@@ -257,6 +304,9 @@ def main():
     
     caption_map = load_captions(CAPTION_PATH)
     
+    # Initialize IDF Calculator
+    idf_calc = IDFCalculator(caption_map, sample_size=50000)
+    
     print(f"Loading Source Data {SOURCE_TRAIN_PATH}...")
     try:
         df_source = pd.read_parquet(SOURCE_TRAIN_PATH)
@@ -297,10 +347,6 @@ def main():
             try: df_bench = pd.read_parquet(f_in)
             except: continue
 
-            # For RAG, we process the FULL file if not limited by user request. 
-            # (If user wants limit, uncomment next line)
-            # df_bench = df_bench.head(10)
-
             new_msgs = []
             records = df_bench.to_dict('records')
             
@@ -328,7 +374,7 @@ def main():
                     else:
                         retrieved_pids.append(tgt)
                 
-                summary = summarize_commonality(retrieved_pids, caption_map)
+                summary = summarize_commonality(retrieved_pids, caption_map, idf_calc)
                 
                 orig_msg = row.get('messages')
                 if summary:
