@@ -1,9 +1,11 @@
 #!/bin/bash
-# bash eval_script_power_decoding.sh checkpoints/OneRec-1.7B power_decoding_test_v1 false ../raw_data/onerec_data/benchmark_data_1000
-# SAMPLE_SIZE=1000 ./benchmarks/eval_script_power_decoding.sh checkpoints/OneRec-1.7B power_decoding_test_v1 false raw_data/onerec_data/benchmark_data_1000
+
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-power_decoding_test}"
+if [ -n "$MODEL_PATH" ] && [ -e "$MODEL_PATH" ]; then
+    MODEL_PATH=$(readlink -f "$MODEL_PATH")
+fi
+VERSION="${VERSION:-power_decoding_test_vtemp}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 
@@ -52,7 +54,7 @@ mkdir -p "$(dirname "${BASE_LOG_NAME}")"
 mkdir -p "$BASE_OUTPUT_DIR"
 
 # Sample size config
-SAMPLE_SIZE="${SAMPLE_SIZE:-1000}"  # Default to 10 for quick test, user can set via env
+SAMPLE_SIZE="${SAMPLE_SIZE:-1000}"  # Default to 1000 per user hint, was 10
 
 {
     echo "========== Task Configuration (Power Decoding) =========="
@@ -62,7 +64,7 @@ SAMPLE_SIZE="${SAMPLE_SIZE:-1000}"  # Default to 10 for quick test, user can set
     echo "Sample Size: $SAMPLE_SIZE"
     echo "Python Exec: $PYTHON_EXEC"
     echo "Model Path: $MODEL_PATH"
-    echo "========================================"
+    echo "======== Task Config End ========"
 } >> "${BASE_LOG_NAME}.log"
 
 THINKING_ARGS=""
@@ -76,24 +78,29 @@ echo "Running Power Decoding Evaluation"
 echo "Log file: ${BASE_LOG_NAME}.log"
 
 # Script location relative to BENCHMARK_BASE_DIR or absolute
-EVAL_PY="${BENCHMARK_BASE_DIR}/scripts/evaluate_power_decoding.py"
+# Using the new script in scripts/ray-vllm/
+EVAL_PY="${BENCHMARK_BASE_DIR}/scripts/ray-vllm/evaluate_power_decoding.py"
 echo "Eval script: $EVAL_PY"
 
 # Task: ad
 echo "Starting task: ad"
 $PYTHON_EXEC -u "$EVAL_PY" \
     --task_types ad \
+    --num_gpus 1 \
+    --gpu_ids 2 \
+    --gpu_memory_utilization 0.8 \
+    --max_num_seqs 256 \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "${BASE_OUTPUT_DIR}" \
     --dtype bfloat16 \
     --overwrite \
+    --use_power_decoding \
     --alpha 2.0 \
     --top_k_candidates 5 \
     --max_rollouts 5 \
     --max_lookahead 3 \
     --crit_threshold 0.5 \
-    --max_new_tokens 64 \
     --sample_size "$SAMPLE_SIZE" \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 
@@ -101,17 +108,21 @@ $PYTHON_EXEC -u "$EVAL_PY" \
 echo "Starting task: product"
 $PYTHON_EXEC -u "$EVAL_PY" \
     --task_types product \
+    --num_gpus 1 \
+    --gpu_ids 2 \
+    --gpu_memory_utilization 0.8 \
+    --max_num_seqs 256 \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "${BASE_OUTPUT_DIR}" \
     --dtype bfloat16 \
     --overwrite \
+    --use_power_decoding \
     --alpha 2.0 \
     --top_k_candidates 5 \
     --max_rollouts 5 \
     --max_lookahead 3 \
     --crit_threshold 0.5 \
-    --max_new_tokens 64 \
     --sample_size "$SAMPLE_SIZE" \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 
@@ -119,17 +130,21 @@ $PYTHON_EXEC -u "$EVAL_PY" \
 echo "Starting task: video"
 $PYTHON_EXEC -u "$EVAL_PY" \
     --task_types video \
+    --num_gpus 1 \
+    --gpu_ids 2 \
+    --gpu_memory_utilization 0.8 \
+    --max_num_seqs 256 \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "${BASE_OUTPUT_DIR}" \
     --dtype bfloat16 \
     --overwrite \
+    --use_power_decoding \
     --alpha 2.0 \
     --top_k_candidates 5 \
     --max_rollouts 5 \
     --max_lookahead 3 \
     --crit_threshold 0.5 \
-    --max_new_tokens 64 \
     --sample_size "$SAMPLE_SIZE" \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 

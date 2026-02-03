@@ -80,10 +80,6 @@ class InferenceConfig:
         default=4,
         metadata={"help": "Batch size for each worker to process prompts (reduce this if KV cache is insufficient)"}
     )
-    max_num_seqs: int = field(
-        default=256,
-        metadata={"help": "Maximum number of sequences per iteration"}
-    )
 
 
 @dataclass
@@ -160,33 +156,4 @@ class BenchmarkConfig:
     overwrite: bool = field(
         default=False,
         metadata={"help": "Whether to overwrite existing results"}
-    )
-
-
-@dataclass
-class PowerDecodingConfig:
-    """Configuration for Future-Aware Power Decoding"""
-    use_power_decoding: bool = field(
-        default=False,
-        metadata={"help": "Enable Power Decoding Generator (HuggingFace-based)"}
-    )
-    alpha: float = field(
-        default=2.0,
-        metadata={"help": "Sharpening exponent alpha"}
-    )
-    top_k_candidates: int = field(
-        default=5,
-        metadata={"help": "Number of candidates for reweighting"}
-    )
-    max_rollouts: int = field(
-        default=5,
-        metadata={"help": "Max number of rollouts per candidate"}
-    )
-    max_lookahead: int = field(
-        default=3,
-        metadata={"help": "Max lookahead steps"}
-    )
-    crit_threshold: float = field(
-        default=0.5,
-        metadata={"help": "Entropy threshold for critical step detection"}
     )

@@ -1,9 +1,5 @@
-#!/bin/bash
-# bash eval_script_rag4_true.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000
 
-# bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000_test_raganswersummary
-
-# bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000
+# bash eval_script_rag4_falserag.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000_test_raganswersummary
 
 # Set common variables
 MODEL_PATH=$1
@@ -58,7 +54,7 @@ PYTHON_EXEC="/home/lkzhang/miniconda3/envs/openonerec/bin/python3"
 # Task: ad
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types ad \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -74,7 +70,7 @@ echo "Ad task completed successfully"
 # Task: product
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types product \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -90,7 +86,7 @@ echo "Product task completed successfully"
 # Task: video
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types video \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -107,7 +103,7 @@ echo "Video task completed successfully"
 # Task: rec_reason
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types rec_reason \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -123,7 +119,7 @@ echo "Rec_reason task completed successfully"
 # Task: item_understand
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types item_understand \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -140,7 +136,7 @@ echo "Item_understand task completed successfully"
 # Task: label_cond
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types label_cond \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -157,7 +153,7 @@ echo "Label_cond task completed successfully"
 # Task: interactive
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types interactive \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -173,7 +169,7 @@ echo "Interactive task completed successfully"
 # Task: label_pred
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 0 \
     --task_types label_pred \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \

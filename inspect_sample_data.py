@@ -1,37 +1,51 @@
 
 import pandas as pd
 import os
+import json
 
-def inspect_parquet(file_path):
-    print(f"--- Inspecting {os.path.basename(file_path)} ---")
-    try:
-        df = pd.read_parquet(file_path)
-        print("Columns:", df.columns.tolist())
-        print("Shape:", df.shape)
-        print("\nFirst 1 Row Sample (dict format):")
-        print(df.iloc[0].to_dict())
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}")
-    print("\n")
+def inspect_processed_ad_data(directory):
+    print(f"--- Inspecting Processed Ad Data in {directory} ---")
+    
+    if not os.path.exists(directory):
+        print(f"Directory not found: {directory}")
+        return
 
-# Check typical OneRec files
-base_dir = "raw_data/onerec_data"
-files_to_check = [
-    "onerec_bench_release.parquet",
-    "pid2caption.parquet" 
-]
+    # List all parquet files in the directory
+    files = [f for f in os.listdir(directory) if f.endswith('.parquet')]
+    files.sort()
 
-for f in files_to_check:
-    path = os.path.join(base_dir, f)
-    if os.path.exists(path):
-        inspect_parquet(path)
-    else:
-        print(f"File not found: {path}")
+    for filename in files:
+        file_path = os.path.join(directory, filename)
+        print(f"\n>>> Reading {filename}...")
+        try:
+            df = pd.read_parquet(file_path)
+            # Iterate through all rows
+            for index, row in df.iterrows():
+                try:
+                    msgs = json.loads(row['messages'])
+                    if msgs and isinstance(msgs, list):
+                        last_msg = msgs[-1]
+                        if last_msg.get('role') == 'user':
+                            content = last_msg.get('content')
+                            text = ""
+                            if isinstance(content, str):
+                                text = content
+                            elif isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, dict) and part.get('type') == 'text':
+                                        text += part.get('text', '')
+                            
+                            # Extract the last line (the summary)
+                            lines = text.strip().split('\n')
+                            if lines:
+                                print(lines[-1])
+                except Exception as e:
+                    print(f"Error parsing row {index}: {e}")
+                    
+        except Exception as e:
+            print(f"Error reading {filename}: {e}")
 
-# Check for processed RL files if they exist
-rl_base = "output/rl_data"
-if os.path.exists(rl_base):
-    for f in os.listdir(rl_base):
-        if f.endswith(".parquet"):
-             inspect_parquet(os.path.join(rl_base, f))
-             break # Just check one
+if __name__ == "__main__":
+    # Target the processed ad directory
+    ad_processed_dir = "raw_data/onerec_data/benchmark_data_1000_test/ad"
+    inspect_processed_ad_data(ad_processed_dir)

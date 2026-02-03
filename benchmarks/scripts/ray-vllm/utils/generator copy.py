@@ -2,9 +2,6 @@ import os
 import ray
 import math
 import json
-import time
-import torch
-import torch.nn.functional as F
 from typing import Dict, List, Any, Optional
 from vllm import LLM, SamplingParams
 from vllm.sampling_params import BeamSearchParams
@@ -122,7 +119,7 @@ class VllmWorker:
 
         Returns:
             Tuple of three dicts:
-            - First dict: {sample_id: [generated_text_1, generated_text_2, ...]})
+            - First dict: {sample_id: [generated_text_1, generated_text_2, ...]}
             - Second dict: {sample_id: [cum_logprob_1, cum_logprob_2, ...]} (only for beam search)
             - Third dict: {sample_id: {"input_tokens": [int], "output_tokens": [int], "times": [float]}} (lists for multi-stage support)
         """
@@ -390,249 +387,6 @@ class VllmWorker:
             all_mfu_stats[sample_id]["times"] = [stage_elapsed_time]
 
         return (all_results, all_mfu_stats)
-
-    def power_decoding_generate_batch(
-        self,
-        prompts: Dict[str, str],
-        pd_config: Dict[str, Any],
-        worker_batch_size: int = 8
-    ) -> tuple:
-        """
-        Batch text generation using Future-Aware Power Decoding
-
-        Args:
-            prompts: {sample_id: prompt_text}
-            pd_config: Power Decoding configuration dictionary
-            worker_batch_size: Worker internal batch size (ignored for now, processing all in one loop for simplicity)
-
-        Returns:
-            Tuple of three dicts:
-            - First dict: {sample_id: [generated_text]}
-            - Second dict: {sample_id: [cum_logprob]} (empty for now)
-            - Third dict: {sample_id: {"input_tokens": [int], "output_tokens": [int], "times": [float]}}
-        """
-        import time
-        stage_start_time = time.time()
-
-        if not prompts:
-            return ({}, {}, {})
-
-        # Unpack PD config
-        alpha = pd_config.get("alpha", 2.0)
-        top_k = pd_config.get("top_k_candidates", 5)
-        max_rollouts = pd_config.get("max_rollouts", 5)
-        max_lookahead = pd_config.get("max_lookahead", 3)
-        crit_threshold = pd_config.get("crit_threshold", 0.5)
-        max_new_tokens = pd_config.get("max_new_tokens", 128)
-
-        # Prepare state
-        # We need to maintain current text for each sample
-        sample_ids = list(prompts.keys())
-        current_texts = {sid: prompts[sid] for sid in sample_ids}
-        generated_tokens = {sid: [] for sid in sample_ids}
-        finished_samples = {sid: False for sid in sample_ids}
-        
-        # Initial MFU stats (input tokens)
-        all_mfu_stats = {}
-        for sid in sample_ids:
-            input_tokens = len(self.tokenizer.encode(prompts[sid], add_special_tokens=True))
-            all_mfu_stats[sid] = {
-                "input_tokens": [input_tokens],
-                "output_tokens": [0]
-            }
-
-        # Sampling params for step 1 (get logits)
-        step1_params = SamplingParams(
-            n=1,
-            max_tokens=1,
-            temperature=1.0, # Use raw probs for entropy/selection
-            logprobs=top_k + 5 # Request enough logprobs to find top-K
-        )
-
-        # Sampling params for rollouts
-        rollout_params = SamplingParams(
-            n=1,
-            max_tokens=max_lookahead,
-            temperature=1.0,
-            logprobs=1 # Need logprobs of generated tokens
-        )
-
-        for t in range(max_new_tokens):
-            # Identify active samples
-            active_sids = [sid for sid in sample_ids if not finished_samples[sid]]
-            if not active_sids:
-                break
-
-            # 1. Base Forward: Get next token logits for active samples
-            active_texts = [current_texts[sid] for sid in active_sids]
-            
-            # vLLM generate
-            step1_outputs = self.llm.generate(active_texts, step1_params, use_tqdm=False)
-            
-            # Process outputs
-            next_token_selections = {} # sid -> selected token text
-            
-            # Identify Critical samples
-            critical_sids = []
-            base_sids = []
-            
-            # Store top-K for critical samples: sid -> [(token_text, prob)]
-            sample_top_k = {}
-
-            for i, output in enumerate(step1_outputs):
-                sid = active_sids[i]
-                
-                # Check for EOS/Finish in base output (unlikely for max_tokens=1 but possible)
-                if output.finished:
-                    # If finished here, it means we generated EOS or something?
-                    # max_tokens=1, so it generated 1 token.
-                    pass
-
-                # Get logprobs of first token
-                # output.outputs[0].logprobs is list of dicts. We want first position.
-                first_token_logprobs = output.outputs[0].logprobs[0] # Dict[token_id, Logprob]
-                
-                # Calculate entropy over top-K (approximation) or full if available
-                # vLLM returns top-N logprobs.
-                probs = []
-                for tid, lp in first_token_logprobs.items():
-                    probs.append(math.exp(lp.logprob))
-                
-                # Normalize probs (since we only have top-N)
-                total_p = sum(probs)
-                if total_p > 0:
-                    probs = [p/total_p for p in probs]
-                
-                entropy = -sum(p * math.log(p + 1e-10) for p in probs)
-                
-                if entropy > crit_threshold:
-                    critical_sids.append(sid)
-                    # Store candidates
-                    # Sort by prob
-                    sorted_candidates = sorted(first_token_logprobs.items(), key=lambda x: x[1].logprob, reverse=True)
-                    candidates = []
-                    for tid, lp in sorted_candidates[:top_k]:
-                        token_text = self.tokenizer.decode([tid]) # Decode for appending
-                        candidates.append((token_text, math.exp(lp.logprob)))
-                    sample_top_k[sid] = candidates
-                else:
-                    base_sids.append(sid)
-                    # Base decode: greedy (top 1)
-                    # Or sample? Using greedy for simplicity as per algo fallback
-                    top_token_id = list(first_token_logprobs.keys())[0] # Ordered by logprob? verify
-                    # Actually vLLM dict is not guaranteed ordered?
-                    # But usually top-k logprobs are returned.
-                    # Let's find max
-                    best_tid = max(first_token_logprobs.items(), key=lambda x: x[1].logprob)[0]
-                    next_token_selections[sid] = self.tokenizer.decode([best_tid])
-
-            # 2. Rollouts for Critical Samples
-            if critical_sids:
-                rollout_prompts = []
-                rollout_map = [] # (sid, candidate_idx)
-                
-                for sid in critical_sids:
-                    candidates = sample_top_k[sid]
-                    base_text = current_texts[sid]
-                    for c_idx, (c_text, c_prob) in enumerate(candidates):
-                        # Create M rollouts
-                        prompt_with_c = base_text + c_text
-                        for r in range(max_rollouts):
-                            rollout_prompts.append(prompt_with_c)
-                            rollout_map.append((sid, c_idx))
-                
-                # Run rollouts
-                rollout_outputs = self.llm.generate(rollout_prompts, rollout_params, use_tqdm=False)
-                
-                # Accumulate scores
-                # sid -> candidate_idx -> list of scores
-                candidate_scores = {} 
-                
-                for i, output in enumerate(rollout_outputs):
-                    sid, c_idx = rollout_map[i]
-                    if sid not in candidate_scores: candidate_scores[sid] = {}
-                    if c_idx not in candidate_scores[sid]: candidate_scores[sid][c_idx] = []
-                    
-                    # Calculate log_prob of sequence
-                    seq_logprob = 0.0
-                    out = output.outputs[0]
-                    if out.logprobs:
-                        for pos, token_logprobs in enumerate(out.logprobs):
-                            if token_logprobs and pos < len(out.token_ids):
-                                actual_token_id = out.token_ids[pos]
-                                if actual_token_id in token_logprobs:
-                                    seq_logprob += token_logprobs[actual_token_id].logprob
-                    
-                    s_r = (alpha - 1) * seq_logprob
-                    candidate_scores[sid][c_idx].append(s_r)
-                
-                # Select winners for critical samples
-                for sid in critical_sids:
-                    candidates = sample_top_k[sid] # [(text, prob), ...]
-                    log_ws = []
-                    
-                    for c_idx, (c_text, c_prob) in enumerate(candidates):
-                        scores = candidate_scores.get(sid, {}).get(c_idx, [-1e9])
-                        # LogSumExp
-                        max_s = max(scores)
-                        sum_exp = sum(math.exp(s - max_s) for s in scores)
-                        log_zeta = max_s + math.log(sum_exp) - math.log(len(scores))
-                        
-                        log_w = alpha * math.log(c_prob + 1e-10) + log_zeta
-                        log_ws.append(log_w)
-                    
-                    # Softmax selection
-                    max_w = max(log_ws)
-                    exps = [math.exp(w - max_w) for w in log_ws]
-                    sum_exps = sum(exps)
-                    probs = [e/sum_exps for e in exps]
-                    
-                    # Sample
-                    # Simple roulette wheel
-                    r = torch.rand(1).item()
-                    cum_p = 0
-                    selected_idx = 0
-                    for i, p in enumerate(probs):
-                        cum_p += p
-                        if r <= cum_p:
-                            selected_idx = i
-                            break
-                    
-                    next_token_selections[sid] = candidates[selected_idx][0]
-
-            # Update state
-            for sid in active_sids:
-                token_text = next_token_selections[sid]
-                generated_tokens[sid].append(token_text) # Should keep raw text or decode?
-                # current_texts needs to append. 
-                current_texts[sid] += token_text
-                all_mfu_stats[sid]["output_tokens"][0] += 1
-                
-                # Check EOS (string matching is hacky, but consistent with prompt construction)
-                # Ideally check token ID.
-                # But here we appended text.
-                # Let's check if the last generated token contains EOS symbol or if vLLM detected it.
-                # vLLM detection happened in step 1?
-                # If generated token is EOS?
-                # We can check token_id if we had it.
-                # For now, let's rely on max_new_tokens or stop string if we had one.
-                # If we assume <|sid_end|> or similar.
-                if "<|sid_end|>" in token_text or "</s>" in token_text:
-                    finished_samples[sid] = True
-
-        # Finish
-        stage_elapsed_time = time.time() - stage_start_time
-        for sid in all_mfu_stats:
-            all_mfu_stats[sid]["times"] = [stage_elapsed_time]
-            
-        # Join generated tokens and strip stop tokens
-        results = {}
-        for sid, tokens in generated_tokens.items():
-            text = "".join(tokens)
-            text = text.replace("<|sid_end|>", "").replace("</s>", "")
-            results[sid] = [text]
-        
-        return (results, {}, all_mfu_stats)
 
 
 class RayVllmGenerator(RayMixin, VllmMixin, Generator):
@@ -902,19 +656,13 @@ class RayVllmGenerator(RayMixin, VllmMixin, Generator):
             **kwargs: Optional generation parameters, including:
                 - worker_batch_size: Worker internal batch size, for avoiding vLLM scheduler issues (default 16)
                 - return_logprobs: Whether to return cumulative logprobs for sampling mode (default False)
-                - pd_config: Power Decoding configuration (triggers PD mode)
 
         Returns:
             Tuple of three dicts:
-            - First dict: {sample_id: [generated_text_1, generated_text_2, ...]})
+            - First dict: {sample_id: [generated_text_1, generated_text_2, ...]}
             - Second dict: {sample_id: [cum_logprob_1, cum_logprob_2, ...]} (for beam search or when return_logprobs=True)
             - Third dict: {sample_id: {"input_tokens": [int], "output_tokens": [int], "times": [float]}} (lists for multi-stage support)
         """
-        # Check for Power Decoding mode
-        pd_config = kwargs.pop("pd_config", None)
-        if pd_config:
-            return self.power_decoding_generate(prompts, pd_config, **kwargs)
-
         # Auto-enable return_logprobs if prompt_token is used (for recommendation tasks)
         has_prompt_token = bool(kwargs.get("prompt_token", None))
         
@@ -1112,54 +860,4 @@ class RayVllmGenerator(RayMixin, VllmMixin, Generator):
         )
 
         return (results, {}, mfu_stats)
-
-    def power_decoding_generate(
-        self,
-        prompts: Dict[str, str],
-        pd_config: Dict[str, Any],
-        **kwargs
-    ) -> tuple:
-        """
-        Execute Power Decoding generation (distributed)
-        """
-        console.print(
-            f"Starting Power Decoding generation (Distributed vLLM)...",
-            style=subhead_style_2,
-        )
-        console.print(f"PD Config: {pd_config}")
-
-        # Round-robin assign tasks to Workers
-        sample_ids = list(prompts.keys())
-        num_workers = len(self.workers)
-        worker_tasks = [dict() for _ in range(num_workers)]
-        
-        for i, sample_id in enumerate(sample_ids):
-            worker_idx = i % num_workers
-            worker_tasks[worker_idx][sample_id] = prompts[sample_id]
-        
-        # Execute in parallel
-        futures = []
-        for worker, task in zip(self.workers, worker_tasks):
-            if task:
-                future = worker.power_decoding_generate_batch.remote(task, pd_config)
-                futures.append(future)
-        
-        # Collect results
-        worker_results = ray.get(futures)
-
-        # Merge results
-        results = {}
-        logprobs = {}
-        mfu_stats = {}
-        for worker_result in worker_results:
-            texts_dict, logprobs_dict, mfu_stats_dict = worker_result
-            results.update(texts_dict)
-            logprobs.update(logprobs_dict)
-            mfu_stats.update(mfu_stats_dict)
-
-        console.print(
-            f"✓ Power Decoding Generation completed",
-            style=success_style,
-        )
-
-        return (results, logprobs, mfu_stats)
+    

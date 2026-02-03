@@ -3,12 +3,11 @@
 
 # bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000_test_raganswersummary
 
-# bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000
+# bash eval_script_rag4_true32.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000
 
 # Set common variables
 MODEL_PATH=$1
-# VERSION="${VERSION:-v1.0_1000_thinktrue32}"
-VERSION="${VERSION:-v1.0_1000_thinkfalse_raganswersummary}"
+VERSION="${VERSION:-v1.0_1000_thinktrue32}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 
@@ -67,7 +66,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Ad task completed successfully"
 
@@ -83,7 +82,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Product task completed successfully"
 
@@ -99,7 +98,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Video task completed successfully"
 
@@ -116,7 +115,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Rec_reason task completed successfully"
 
@@ -132,7 +131,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Item_understand task completed successfully"
 
@@ -149,7 +148,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Label_cond task completed successfully"
 
@@ -166,7 +165,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Interactive task completed successfully"
 
@@ -183,7 +182,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --worker_batch_size 3200 \
     --max_logprobs 10000 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 32 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Label_pred task completed successfully"
 
