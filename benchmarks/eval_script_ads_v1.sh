@@ -6,7 +6,7 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_1000_ads_grounding_v1ad}"
+VERSION="${VERSION:-v1.0_1000_ads_grounding_v2ad}"
 ENABLE_THINKING=${3:-true}  # ADS is most effective with thinking enabled
 CUSTOM_DATA_DIR=$4
 

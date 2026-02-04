@@ -45,6 +45,10 @@ class ADSHuggingFaceGenerator(Generator):
         self.sid_begin_id = self.tokenizer.convert_tokens_to_ids(self.sid_begin_token)
         self.sid_end_id = self.tokenizer.convert_tokens_to_ids(self.sid_end_token)
         
+        # Identify </think> token ID for banning
+        self.think_end_token = "</think>"
+        self.think_end_token_id = self.tokenizer.convert_tokens_to_ids(self.think_end_token)
+        
         # Trigger token for ADS (newline) 
         self.trigger_token = "\n" 
         self.trigger_token_id = self.tokenizer.convert_tokens_to_ids(self.trigger_token)
@@ -184,7 +188,7 @@ class ADSHuggingFaceGenerator(Generator):
             past_key_values = None
             
             generated_start_idx = input_ids.shape[1]
-            last_ads_trigger_step = 0 # Initialize to 0 to enforce warmup (text before first item)
+            last_ads_trigger_step = 0 # Initialize to 0 to enforce warmup (text before first item) 
             
             with torch.no_grad():
                 for step in range(max_new_tokens):
@@ -198,9 +202,16 @@ class ADSHuggingFaceGenerator(Generator):
                     past_key_values = outputs.past_key_values
                     next_token_logits = outputs.logits[:, -1, :]
                     
-                    # Force Text Generation: Ban <|sid_begin|> to prevent the model from generating items spontaneously.
-                    # We want items to ONLY appear when interleaved by ADS logic.
-                    next_token_logits[:, self.sid_begin_id] = -float("inf")
+                    # Force Text Generation: Ban <|sid_begin|> and STOP tokens for a window after ADS trigger.
+                    # This ensures that after an item is inserted (or at the start), the model generates text 
+                    # rather than immediately stopping or generating another item.
+                    steps_since_ads = step - last_ads_trigger_step
+                    # Window of 10 steps: Ban item start and early stopping
+                    if steps_since_ads <= 10:
+                        next_token_logits[:, self.sid_begin_id] = -float("inf")
+                        next_token_logits[:, self.tokenizer.eos_token_id] = -float("inf")
+                        if self.think_end_token_id:
+                            next_token_logits[:, self.think_end_token_id] = -float("inf")
                     
                     if temperature > 0:
                         probs = torch.softmax(next_token_logits / temperature, dim=-1)
@@ -212,14 +223,18 @@ class ADSHuggingFaceGenerator(Generator):
                     tokens_to_append = next_token
                     decoded_token = self.tokenizer.decode(next_token_id)
                     
+                    # Check stop conditions
+                    should_stop = False
                     if next_token_id == self.tokenizer.eos_token_id or any(s in decoded_token for s in stop_strs):
-                        break
+                        should_stop = True
 
                     # --- ADS LOGIC ---
+                    # Only run ADS if not stopping
                     # Cooldown: Don't trigger if we triggered recently (e.g., last 10 steps)
-                    if (next_token_id == self.trigger_token_id or "\n" in decoded_token) and \
+                    if not should_stop and \
+                       (next_token_id == self.trigger_token_id or "\n" in decoded_token) and \
                        item_ranges and \
-                       (step - last_ads_trigger_step > 10):
+                       (steps_since_ads > 10):
                        
                         all_layers_attn = torch.stack(outputs.attentions) 
                         avg_attn = all_layers_attn[:, 0, :, -1, :].mean(dim=[0, 1]) 
@@ -247,7 +262,7 @@ class ADSHuggingFaceGenerator(Generator):
                                 past_key_values = None 
                                 last_ads_trigger_step = step
                     
-                    # Update all_ids
+                    # Update all_ids (including stop token if generated)
                     all_ids = torch.cat([all_ids, tokens_to_append], dim=1)
                     
                     if past_key_values is None:
@@ -257,6 +272,9 @@ class ADSHuggingFaceGenerator(Generator):
                     
                     # Total generated length check
                     if all_ids.shape[1] - generated_start_idx >= max_new_tokens:
+                        break
+                    
+                    if should_stop:
                         break
             
             generated_tokens = all_ids[0, generated_start_idx:]
