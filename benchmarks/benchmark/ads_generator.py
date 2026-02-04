@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
+import re
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Dict, List, Any, Optional, Tuple
 from benchmark.base_generator import Generator
@@ -11,6 +12,7 @@ class ADSHuggingFaceGenerator(Generator):
     """
     Generator implementing Attention-driven Selection (ADS) for Interleaved-Modal CoT.
     Uses HuggingFace Transformers with proper KV caching for efficiency.
+    Implements "Backfill" strategy: inserts placeholders during reasoning, fills actual SIDs for final answer.
     """
     def __init__(self, model_path: str, ads_top_k: int = 1, gpu_ids: Optional[List[int]] = None, **kwargs):
         self.model_name = model_path
@@ -70,39 +72,50 @@ class ADSHuggingFaceGenerator(Generator):
                 items.append((start_idx, i))
         return items
 
+    def _backfill_placeholders(self, text: str) -> str:
+        """Replace <Hidx> placeholders with actual SID sequences from the text history."""
+        # Find all history items (SIDs) in the prompt text
+        pattern = r"<\|sid_begin\|>.*?<\|sid_end|>"
+        history_items = re.findall(pattern, text)
+        
+        def replace_func(match):
+            idx = int(match.group(1))
+            if 0 <= idx < len(history_items):
+                return history_items[idx]
+            return match.group(0) # Keep as is if index out of bounds
+            
+        new_text = re.sub(r"<H(\d+)>", replace_func, text)
+        return new_text
+
     def _generate_standard(self, prompts: Dict[str, str], **kwargs) -> Tuple[Dict[str, List[str]], Dict[str, List[float]], Dict[str, Any]]:
-        # Split logic: standard generation (beam search) vs ADS generation (sampling loop)
         num_beams = kwargs.get("num_beams", 1)
         stop_strs = kwargs.get("stop", [])
         
-        # Heuristic: if we are stopping at </think>, we are in Stage 1 (Thinking) -> Use ADS
-        # If num_beams > 1, we are in Stage 2 (Answer) -> Use standard HF generate
         if num_beams > 1 or "</think>" not in stop_strs:
             return self._generate_with_hf_generate(prompts, **kwargs)
         else:
             return self._generate_with_ads_loop(prompts, **kwargs)
 
     def _generate_with_hf_generate(self, prompts: Dict[str, str], **kwargs) -> Tuple[Dict[str, List[str]], Dict[str, List[float]], Dict[str, Any]]:
-        # Clear cache before heavy beam search
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
         results = {}
         mfu_stats = {}
-        logprobs = {} # Empty for now as HF beam search logprobs structure is different
+        logprobs = {} 
         
-        # Unpack parameters
         num_beams = kwargs.get("num_beams", 1)
         num_return_sequences = kwargs.get("num_return_sequences", 1)
         max_new_tokens = kwargs.get("max_new_tokens", 512)
         
         total_samples = len(prompts)
         for i, (sample_id, prompt) in enumerate(prompts.items()):
-            # if (i + 1) % 1 == 0:
-            #     console.print(f"Generating sample {i+1}/{total_samples} (Standard)...", style="dim")
-            
             start_time = time.time()
-            inputs = self.tokenizer(prompt, return_tensors="pt")
+            
+            # --- BACKFILL STEP ---
+            backfilled_prompt = self._backfill_placeholders(prompt)
+            
+            inputs = self.tokenizer(backfilled_prompt, return_tensors="pt")
             input_ids = inputs.input_ids.to(self.device)
             attention_mask = inputs.attention_mask.to(self.device)
             
@@ -118,7 +131,6 @@ class ADSHuggingFaceGenerator(Generator):
                         early_stopping=True
                     )
                 
-                # Decode sequences
                 input_len = input_ids.shape[1]
                 decoded_texts = []
                 for seq in generated_outputs:
@@ -134,27 +146,10 @@ class ADSHuggingFaceGenerator(Generator):
                 }
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    console.print(f"OOM during sample {sample_id}. Clearing cache and retrying with fewer beams...", style="bold red")
+                    console.print(f"OOM during sample {sample_id}. Clearing cache...", style="bold red")
                     torch.cuda.empty_cache()
-                    # Fallback to fewer beams
-                    with torch.no_grad():
-                        generated_outputs = self.model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            max_new_tokens=max_new_tokens,
-                            num_beams=max(1, num_beams // 4), # Reduce beams significantly
-                            num_return_sequences=min(num_return_sequences, max(1, num_beams // 4)),
-                            pad_token_id=self.tokenizer.pad_token_id,
-                            early_stopping=True
-                        )
-                    # Decode (fallback)
-                    input_len = input_ids.shape[1]
-                    decoded_texts = []
-                    for seq in generated_outputs:
-                        decoded = self.tokenizer.decode(seq[input_len:], skip_special_tokens=True)
-                        decoded_texts.append(decoded)
-                    results[sample_id] = decoded_texts
-                    mfu_stats[sample_id] = {"input_tokens": [input_len], "output_tokens": [0], "times": [0]}
+                    results[sample_id] = [""] * num_return_sequences
+                    mfu_stats[sample_id] = {"input_tokens": [0], "output_tokens": [0], "times": [0]}
                 else:
                     raise e
             finally:
@@ -173,11 +168,14 @@ class ADSHuggingFaceGenerator(Generator):
         stop_strs = kwargs.get("stop", [])
         temperature = kwargs.get("temperature", 0.0)
         
+        # Pre-compute static tokens for reconstruction
+        prefix_text = " 证据是用户曾经交互过 "
+        suffix_text = "\n"
+        prefix_tokens = self.tokenizer.encode(prefix_text, add_special_tokens=False, return_tensors="pt").to(self.device)
+        suffix_tokens = self.tokenizer.encode(suffix_text, add_special_tokens=False, return_tensors="pt").to(self.device)
+        
         total_samples = len(prompts)
         for i, (sample_id, prompt) in enumerate(prompts.items()):
-            # if (i + 1) % 1 == 0:
-            #     console.print(f"Generating sample {i+1}/{total_samples} (ADS)...", style="dim")
-            
             start_time = time.time()
             inputs = self.tokenizer(prompt, return_tensors="pt")
             input_ids = inputs.input_ids.to(self.device)
@@ -188,7 +186,11 @@ class ADSHuggingFaceGenerator(Generator):
             past_key_values = None
             
             generated_start_idx = input_ids.shape[1]
-            last_ads_trigger_step = 0 # Initialize to 0 to enforce warmup (text before first item) 
+            last_ads_trigger_step = 0
+            
+            # Store insertions: list of (insertion_index_relative_to_gen, item_idx)
+            # We store item_idx to resolve to actual tokens later
+            insertions = []
             
             with torch.no_grad():
                 for step in range(max_new_tokens):
@@ -202,16 +204,9 @@ class ADSHuggingFaceGenerator(Generator):
                     past_key_values = outputs.past_key_values
                     next_token_logits = outputs.logits[:, -1, :]
                     
-                    # Force Text Generation: Ban <|sid_begin|> and STOP tokens for a window after ADS trigger.
-                    # This ensures that after an item is inserted (or at the start), the model generates text 
-                    # rather than immediately stopping or generating another item.
-                    steps_since_ads = step - last_ads_trigger_step
-                    # Window of 10 steps: Ban item start and early stopping
-                    if steps_since_ads <= 10:
-                        next_token_logits[:, self.sid_begin_id] = -float("inf")
-                        next_token_logits[:, self.tokenizer.eos_token_id] = -float("inf")
-                        if self.think_end_token_id:
-                            next_token_logits[:, self.think_end_token_id] = -float("inf")
+                    # --- CONSTRAINTS ---
+                    # 1. STRICTLY BAN raw SID generation during thinking
+                    next_token_logits[:, self.sid_begin_id] = -float("inf")
                     
                     if temperature > 0:
                         probs = torch.softmax(next_token_logits / temperature, dim=-1)
@@ -223,18 +218,16 @@ class ADSHuggingFaceGenerator(Generator):
                     tokens_to_append = next_token
                     decoded_token = self.tokenizer.decode(next_token_id)
                     
-                    # Check stop conditions
                     should_stop = False
                     if next_token_id == self.tokenizer.eos_token_id or any(s in decoded_token for s in stop_strs):
                         should_stop = True
 
-                    # --- ADS LOGIC ---
-                    # Only run ADS if not stopping
-                    # Cooldown: Don't trigger if we triggered recently (e.g., last 10 steps)
+                    # --- ADS LOGIC (Pure Recording) ---
+                    # Trigger check
                     if not should_stop and \
                        (next_token_id == self.trigger_token_id or "\n" in decoded_token) and \
                        item_ranges and \
-                       (steps_since_ads > 10):
+                       (step - last_ads_trigger_step > 10):
                        
                         all_layers_attn = torch.stack(outputs.attentions) 
                         avg_attn = all_layers_attn[:, 0, :, -1, :].mean(dim=[0, 1]) 
@@ -250,19 +243,21 @@ class ADSHuggingFaceGenerator(Generator):
                             top_items = item_scores[:self.ads_top_k]
                             top_items.sort(key=lambda x: x[1])
                             
-                            inserted_sequences = []
-                            for _, item_idx in top_items:
-                                start, end = item_ranges[item_idx]
-                                item_tokens = all_ids[0, start:end+1]
-                                inserted_sequences.append(item_tokens)
+                            # Record insertion for the first top item (Top-1 for now based on previous code)
+                            # Or loop if Top-K > 1? The previous code concatenated them.
+                            # "The evidence is that users like XX" for each selected item.
                             
-                            if inserted_sequences:
-                                all_inserted = torch.cat(inserted_sequences)
-                                tokens_to_append = torch.cat([next_token.view(1), all_inserted]).unsqueeze(0)
-                                past_key_values = None 
+                            insertion_point = all_ids.shape[1] - generated_start_idx + 1
+                            
+                            current_insertions = []
+                            for _, item_idx in top_items:
+                                current_insertions.append(item_idx)
+                                
+                            if current_insertions:
+                                insertions.append((insertion_point, current_insertions))
                                 last_ads_trigger_step = step
                     
-                    # Update all_ids (including stop token if generated)
+                    # Update context with ONLY the next token (Standard Autoregressive)
                     all_ids = torch.cat([all_ids, tokens_to_append], dim=1)
                     
                     if past_key_values is None:
@@ -270,27 +265,58 @@ class ADSHuggingFaceGenerator(Generator):
                     else:
                         curr_input_ids = tokens_to_append
                     
-                    # Total generated length check
                     if all_ids.shape[1] - generated_start_idx >= max_new_tokens:
                         break
                     
                     if should_stop:
                         break
             
-            generated_tokens = all_ids[0, generated_start_idx:]
-            decoded_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            # --- RECONSTRUCTION (Resolving SIDs) ---
+            generated_only = all_ids[0, generated_start_idx:]
+            final_tokens_list = []
+            current_idx = 0
+            
+            # insertions is sorted by insertion_point (ascending)
+            for point, item_indices in insertions:
+                # Append segment from last point to current point
+                if point > current_idx:
+                    final_tokens_list.append(generated_only[current_idx:point])
+                
+                # Construct and append full evidence text for each selected item
+                for item_idx in item_indices:
+                    # Retrieve actual item tokens from input_ids
+                    start, end = item_ranges[item_idx]
+                    # Ensure indices are within bounds (they should be, as they come from input_ids)
+                    item_tokens_tensor = input_ids[0, start:end+1]
+                    
+                    # [Prefix] + [Item Tokens] + [Suffix/Newline]
+                    # Note: prefix_tokens shape is [1, L], item_tokens_tensor is [L]
+                    full_insertion = torch.cat([prefix_tokens[0], item_tokens_tensor, suffix_tokens[0]])
+                    final_tokens_list.append(full_insertion)
+                
+                current_idx = point
+            
+            # Append remaining
+            if current_idx < len(generated_only):
+                final_tokens_list.append(generated_only[current_idx:])
+                
+            if final_tokens_list:
+                final_token_tensor = torch.cat(final_tokens_list)
+            else:
+                final_token_tensor = torch.tensor([], dtype=torch.long, device=self.device)
+
+            decoded_text = self.tokenizer.decode(final_token_tensor, skip_special_tokens=True)
             results[sample_id] = [decoded_text]
             
             mfu_stats[sample_id] = {
                 "input_tokens": [generated_start_idx],
-                "output_tokens": [len(generated_tokens)],
+                "output_tokens": [len(final_token_tensor)],
                 "times": [time.time() - start_time]
             }
             
         return results, logprobs, mfu_stats
 
     def cleanup(self):
-        """Cleanup resources. For HF generator, we just move model to CPU or del."""
         import gc
         if hasattr(self, 'model'):
             del self.model

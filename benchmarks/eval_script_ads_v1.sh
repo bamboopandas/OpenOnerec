@@ -6,7 +6,7 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_1000_ads_grounding_v2ad}"
+VERSION="${VERSION:-v1.0_1000_ads_grounding_v3ad}"
 ENABLE_THINKING=${3:-true}  # ADS is most effective with thinking enabled
 CUSTOM_DATA_DIR=$4
 
@@ -62,7 +62,7 @@ ADS_ARGS="--generator_type ads --ads_top_k 1 --sample_size 1000"
 # Task: ad
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --num_gpus 1 \
-    --gpu_ids 1 \
+    --gpu_ids 4 \
     --task_types ad \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -78,7 +78,7 @@ echo "Ad task completed successfully"
 # # Task: product
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
-#     --gpu_ids 1 \
+#     --gpu_ids 4 \
 #     --task_types product \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -94,7 +94,7 @@ echo "Ad task completed successfully"
 # # Task: video
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
-#     --gpu_ids 1 \
+#     --gpu_ids 4 \
 #     --task_types video \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -110,7 +110,7 @@ echo "Ad task completed successfully"
 # # Task: rec_reason
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
-#     --gpu_ids 1 \
+#     --gpu_ids 4 \
 #     --task_types rec_reason \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -126,7 +126,7 @@ echo "Ad task completed successfully"
 # # Task: item_understand
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
-#     --gpu_ids 1 \
+#     --gpu_ids 4 \
 #     --task_types item_understand \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -142,7 +142,7 @@ echo "Ad task completed successfully"
 # # Task: label_cond
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
-#     --gpu_ids 1 \
+#     --gpu_ids 4 \
 #     --task_types label_cond \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -158,7 +158,7 @@ echo "Ad task completed successfully"
 # # Task: interactive
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
-#     --gpu_ids 1 \
+#     --gpu_ids 4 \
 #     --task_types interactive \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -174,7 +174,7 @@ echo "Ad task completed successfully"
 # # Task: label_pred
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
-#     --gpu_ids 1 \
+#     --gpu_ids 4 \
 #     --task_types label_pred \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
