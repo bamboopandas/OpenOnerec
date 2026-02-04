@@ -5,7 +5,7 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_compressed_cot_v1}"
+VERSION="${VERSION:-v1.0_compressed_cot_v2}"
 ENABLE_THINKING=${3:-true}
 CUSTOM_DATA_DIR=$4
 
@@ -56,7 +56,7 @@ PYTHON_EXEC="/home/lkzhang/miniconda3/envs/openonerec/bin/python3"
 # generator_type is ignored by evaluate_compressed.py but we keep it for consistency
 # sample_size 1 is inherited from ads script example, can be changed
 # We use num_beams 4 for the final stage (Stage 3), and num_return_sequences 4
-ARGS="--generator_type compressed_cot --sample_size 1 --sample_size 1"
+ARGS="--generator_type compressed_cot --sample_size 1 --sample_size 1000"
 
 # Task: ad
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \

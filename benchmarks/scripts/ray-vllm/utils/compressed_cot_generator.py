@@ -93,8 +93,9 @@ class CompressedCoTGenerator(RayVllmGenerator):
 
         # Configure kwargs for Stage 2 (Summarization)
         kwargs_stage2 = kwargs.copy()
+        kwargs_stage2.pop("prompt_token", None) # Remove prompt_token to avoid triggering ID generation
         kwargs_stage2["max_new_tokens"] = 256 # Short summary
-        kwargs_stage2["stop"] = [] # Default stops
+        kwargs_stage2["stop"] = ["<|sid_begin|>"] # Strictly stop if it tries to generate SIDs
         kwargs_stage2["num_beams"] = 1
         kwargs_stage2["num_return_sequences"] = 1
         kwargs_stage2["temperature"] = 0.2 # Low temp for deterministic summary
@@ -153,8 +154,13 @@ class CompressedCoTGenerator(RayVllmGenerator):
             summary_id = f"{sample_id}_summary"
             summary = stage2_results[summary_id][0].strip()
             
-            # Construct the prefix
-            prefix = f"<think>Summary of reasoning: {summary}</think>\n{prompt_token}"
+            # Clean up the summary by removing common prefixes
+            for prefix_to_strip in ["简要总结：", "简要总结:", "Summary:", "Summary of reasoning:", "总结：", "总结:"]:
+                if summary.startswith(prefix_to_strip):
+                    summary = summary[len(prefix_to_strip):].strip()
+            
+            # Construct the prefix - removed the hardcoded "Summary of reasoning:"
+            prefix = f"<think>{summary}</think>\n{prompt_token}"
             
             # Prepend to all beam answers
             final_answers = []
