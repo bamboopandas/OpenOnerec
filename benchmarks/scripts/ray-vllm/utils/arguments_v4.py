@@ -139,10 +139,6 @@ class PromptConfig:
         default=False,
         metadata={"help": "Enable thinking mode for apply_chat_template (overrides task config if set)"}
     )
-    max_new_thinking_tokens: Optional[int] = field(
-        default=None,
-        metadata={"help": "Maximum number of tokens for thinking generation"}
-    )
 
 
 @dataclass
