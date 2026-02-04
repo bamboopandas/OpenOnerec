@@ -66,6 +66,15 @@ class InfrastructureConfig:
 @dataclass
 class InferenceConfig:
     """Inference execution and optimization parameters"""
+    # Generator selection
+    generator_type: str = field(
+        default="vllm",
+        metadata={"help": "Generator type: 'vllm' (standard Ray-vLLM) or 'ads' (ADS-HuggingFace)"}
+    )
+    ads_top_k: int = field(
+        default=1,
+        metadata={"help": "Number of items to select via ADS (only for ads generator)"}
+    )
     # vLLM optimizations (chunked_prefill, prefix_caching)
     force_enable_optimizations: bool = field(
         default=False,

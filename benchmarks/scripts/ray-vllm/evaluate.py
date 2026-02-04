@@ -3,6 +3,7 @@ import torch
 
 from benchmark import Benchmark
 from benchmark.console import *
+from benchmark.ads_generator import ADSHuggingFaceGenerator
 from utils.generator import RayVllmGenerator
 from utils.arguments import (
     ModelConfig,
@@ -36,25 +37,34 @@ def main():
     )
     # Benchmark.print_benchmark_table()
 
-    # 2. Initialize Ray + vLLM generator (Multi-Node Support)
-    generator = RayVllmGenerator(
-        model_name_or_path=model_config.model_path,
-        checkpoint_path=model_config.checkpoint_path,
-        trust_remote_code=model_config.trust_remote_code,
-        dtype=model_config.dtype,
-        max_model_len=model_config.max_model_len,
-        max_logprobs=model_config.max_logprobs,
-        gpu_memory_utilization=infra_config.gpu_memory_utilization,
-        tensor_parallel_size=infra_config.tensor_parallel_size,
-        ray_address=infra_config.ray_address,  # Ray cluster address
-        allow_cross_node_tensor_parallel=infra_config.allow_cross_node_tensor_parallel,  # Cross-node TP
-        num_gpus=infra_config.num_gpus,
-        gpu_ids=infra_config.gpu_ids,
-        force_enable_optimizations=inference_config.force_enable_optimizations,
-        force_disable_optimizations=inference_config.force_disable_optimizations,
-        worker_batch_size=inference_config.worker_batch_size,
-        task_types=benchmark_config.task_types
-    )
+    # 2. Initialize Generator
+    if inference_config.generator_type == "ads":
+        console.print(f"Initializing ADS HuggingFace Generator (Top-K={inference_config.ads_top_k})...", style=warning_style)
+        generator = ADSHuggingFaceGenerator(
+            model_path=model_config.model_path,
+            ads_top_k=inference_config.ads_top_k,
+            gpu_ids=infra_config.gpu_ids
+        )
+    else:
+        # 2. Initialize Ray + vLLM generator (Multi-Node Support)
+        generator = RayVllmGenerator(
+            model_name_or_path=model_config.model_path,
+            checkpoint_path=model_config.checkpoint_path,
+            trust_remote_code=model_config.trust_remote_code,
+            dtype=model_config.dtype,
+            max_model_len=model_config.max_model_len,
+            max_logprobs=model_config.max_logprobs,
+            gpu_memory_utilization=infra_config.gpu_memory_utilization,
+            tensor_parallel_size=infra_config.tensor_parallel_size,
+            ray_address=infra_config.ray_address,  # Ray cluster address
+            allow_cross_node_tensor_parallel=infra_config.allow_cross_node_tensor_parallel,  # Cross-node TP
+            num_gpus=infra_config.num_gpus,
+            gpu_ids=infra_config.gpu_ids,
+            force_enable_optimizations=inference_config.force_enable_optimizations,
+            force_disable_optimizations=inference_config.force_disable_optimizations,
+            worker_batch_size=inference_config.worker_batch_size,
+            task_types=benchmark_config.task_types
+        )
 
     # 3. Generate text
     benchmark.run(
