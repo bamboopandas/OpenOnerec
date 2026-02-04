@@ -70,9 +70,9 @@ import json
 import pprint
 
 # Load the processed file
-file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_raganswersummary_v2/video/video_test.parquet'
+# file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_self_latestitemsummary_v1/video/video_test.parquet'
 # file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_raganswersummary/product/product_test.parquet'
-# file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_raganswersummary/ad/ad_test.parquet'
+file_path = '/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/raw_data/onerec_data/benchmark_data_1000_test_self_latestitemsummary_v1/ad/ad_test.parquet'
 df = pd.read_parquet(file_path)
 
 # Take the first row

@@ -5,22 +5,21 @@ import numpy as np
 from tqdm import tqdm
 from collections import defaultdict, Counter
 import re
+import math
+import random
 
 # ================= Configuration =================
-SOURCE_TRAIN_PATH = "raw_data/onerec_data/onerec_bench_release.parquet"
 BENCHMARK_BASE_DIR = "raw_data/onerec_data/benchmark_data_1000"
-OUTPUT_BASE_DIR = "raw_data/onerec_data/benchmark_data_1000_test_raganswersummary_v3"
+OUTPUT_BASE_DIR = "raw_data/onerec_data/benchmark_data_1000_test_self_latestitemsummary_v1"
 CAPTION_PATH = "raw_data/onerec_data/pid2caption.parquet"
 
-# RAG Configuration
-MIN_SIMILARITY_SCORE = 0.005 
-MATCHING_HIST_LEN = 20
-TOP_K_USERS = 3
+# Config
+MATCHING_HIST_LEN = 20 # Use last 20 items for summary
 
 TASK_CONFIG = {
-    'video': {'index_type': 'video', 'bench_hist_col': 'hist_pid'},
-    'ad': {'index_type': 'ad', 'bench_hist_col': 'hist_ad'},
-    'product': {'index_type': 'product', 'bench_hist_col': 'hist_goods'},
+    'video': {'bench_hist_col': 'hist_pid'},
+    'ad': {'bench_hist_col': 'hist_ad'},
+    'product': {'bench_hist_col': 'hist_goods'}, # Prioritize interested (goods) over viewed (longview)
 }
 
 # 1. Semantic Stop Words (Don't want these as keywords)
@@ -33,10 +32,12 @@ STOP_WORDS = {
     '自己', '大家', '由于', '提供', '有限', '具体', '未知', '无法', '针对', '进行', 
     '压缩', '总结', '信息', '介绍', '分享', '包含', '其中', '以及', '非常', '十分',
     '通过', '观众', '一种', '一样', '一旦', '一直', '一些', '一切',
-    # Expanded stop words for better quality
+    # Added common artifacts and generic terms
     '视频中', '画面', '兴趣', '生活', '相关', '部分', '点击', '链接', '详情', 
     '查看', '更多', '商品', '产品', '推荐', '物品', '东西', '事物', '可能', 
-    '涉及', '主题', '感觉', '觉得', '认为', '使用', '利用', '喜欢', '喜爱'
+    '涉及', '主题', '感觉', '觉得', '认为', '使用', '利用', '喜欢', '喜爱',
+    # Bad fragments
+    '览器', '费书', '空浏', '笔小新'
 }
 
 # 2. Structural Stop Chars/Words (N-grams cannot START or END with these)
@@ -60,7 +61,7 @@ def load_captions(path):
     return dict(zip(df['pid'], df['dense_caption']))
 
 def get_ngrams(text, n_list=[2, 3, 4, 5, 6]):
-    """Extracts n-grams from cleaned text, supporting longer entities."""
+    """Extracts n-grams from cleaned text."""
     # Keep chinese, numbers, and english letters
     text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text)
     grams = []
@@ -81,58 +82,84 @@ def is_valid_ngram(gram):
     if gram[0] in STRUCTURAL_STOPS or gram[-1] in STRUCTURAL_STOPS:
         return False
     
-    # Heuristic: If > 50% of characters are in stop lists, drop it
+    # Heuristic: If > 50% of the string corresponds to stop-chars/words, drop it.
     stop_char_count = sum(1 for c in gram if c in STRUCTURAL_STOPS or c in STOP_WORDS)
     if stop_char_count / len(gram) > 0.5:
         return False
-    
+
     return True
 
-def filter_redundant_terms(counter, threshold_ratio=1.2):
+class IDFCalculator:
+    def __init__(self, caption_map, sample_size=50000):
+        self.doc_freq = defaultdict(int)
+        self.total_docs = 0
+        self.compute_idf(caption_map, sample_size)
+
+    def compute_idf(self, caption_map, sample_size):
+        print(f"Computing global IDF from sample of {sample_size} captions...")
+        all_pids = list(caption_map.keys())
+        if len(all_pids) > sample_size:
+            sampled_pids = random.sample(all_pids, sample_size)
+        else:
+            sampled_pids = all_pids
+        
+        self.total_docs = len(sampled_pids)
+        
+        for pid in tqdm(sampled_pids, desc="IDF Build"):
+            text = caption_map[pid]
+            grams = set(get_ngrams(text, [2, 3, 4, 5, 6])) # Use set to count DF (once per doc)
+            for g in grams:
+                if is_valid_ngram(g):
+                    self.doc_freq[g] += 1
+        
+        print(f"IDF computed for {len(self.doc_freq)} terms.")
+
+    def get_score(self, term):
+        # IDF = log(N / (df + 1))
+        df = self.doc_freq.get(term, 0)
+        # Smooth IDF: +1 to avoid division by zero (though df+1 handles it)
+        # Using base 10 log
+        return math.log10((self.total_docs + 1) / (df + 1))
+
+def filter_redundant_terms(scored_terms, top_k=3):
     """
-    Filters out terms that are substrings of longer terms with similar frequency.
-    Ex: 'Doubao AI' (10) vs 'Doubao AI Assistant' (10) -> Keep longer.
+    Selects top terms that are not too similar to each other.
+    scored_terms: list of (term, score), sorted by score desc.
     """
-    # Sort by Length DESCENDING (Longest first)
-    items = list(counter.items())
-    # Sort primarily by length (desc), secondary by freq (desc)
-    items.sort(key=lambda x: (len(x[0]), x[1]), reverse=True)
+    # 1. Sort by Length DESC
+    candidates = sorted(scored_terms, key=lambda x: len(x[0]), reverse=True)
     
-    final_terms = {}
+    kept_terms = [] # List of (term, score)
     
-    # Check each term against valid longer terms found so far? 
-    # No, we need to check against ALL terms.
-    
-    sorted_by_freq = sorted(items, key=lambda x: x[1], reverse=True)
-    # Limit to top candidate pool to avoid O(N^2) on huge lists
-    candidates = sorted_by_freq[:60] 
-    
-    candidate_map = dict(candidates)
-    
-    processed_terms = set()
-    
-    # Iterate through candidates. Since we want to KEEP the best, 
-    # we can just iterate and see if it is a substring of another "better" candidate.
-    
-    for term, count in candidates:
+    for term, score in candidates:
         is_redundant = False
-        for other, other_count in candidates:
-            if term == other: continue
+        for existing_term, existing_score in kept_terms:
+            # Check substring
+            if term in existing_term: 
+                # term is a substring of existing (longer) term.
+                # Only keep if score is significantly higher (rare case for TF-IDF if IDF is boosting short term?)
+                # But generally we prefer the longer term.
+                is_redundant = True
+                break
             
-            # If term is inside other (e.g. "Peace" in "Peace Elite")
-            if term in other:
-                # If "Peace" freq is not much higher than "Peace Elite", 
-                # it means "Peace" rarely appears alone.
-                if count <= other_count * threshold_ratio:
-                    is_redundant = True
-                    break
+            # Check overlap (Jaccard-ish for characters)
+            set_a = set(term)
+            set_b = set(existing_term)
+            overlap = len(set_a.intersection(set_b))
+            union = len(set_a.union(set_b))
+            if union > 0 and overlap / union > 0.6: 
+                is_redundant = True
+                break
         
         if not is_redundant:
-            final_terms[term] = count
+            kept_terms.append((term, score))
             
-    return Counter(final_terms)
+    # 3. Sort by Score DESC to pick top K
+    kept_terms.sort(key=lambda x: x[1], reverse=True)
+    
+    return [t[0] for t in kept_terms[:top_k]]
 
-def summarize_commonality(pids, caption_map):
+def summarize_commonality(pids, caption_map, idf_calc):
     if not pids: return ""
     captions = []
     for pid in pids:
@@ -144,93 +171,36 @@ def summarize_commonality(pids, caption_map):
     
     if not captions: return ""
 
-    counter = Counter()
+    # TF Counting
+    tf_counter = Counter()
     for cap in captions:
-        grams = get_ngrams(cap, [2, 3, 4, 5, 6]) # Longer n-grams
+        grams = get_ngrams(cap, [2, 3, 4, 5, 6]) 
         for g in grams:
             if is_valid_ngram(g):
-                counter[g] += 1
+                tf_counter[g] += 1
                 
-    if not counter: return ""
+    if not tf_counter: return ""
 
-    refined_counter = filter_redundant_terms(counter)
-    common_terms = [item[0] for item in refined_counter.most_common(3)]
+    # TF-IDF Scoring
+    scored_terms = []
+    for term, tf in tf_counter.items():
+        idf = idf_calc.get_score(term)
+        score = tf * idf
+        scored_terms.append((term, score))
+    
+    # Sort by Score DESC (to filter candidates pool if needed, though we passed all to filter func before)
+    # Actually, we should probably limit candidates BEFORE filtering to avoid O(N^2)
+    scored_terms.sort(key=lambda x: x[1], reverse=True)
+    
+    # Take candidates for diversity filtering
+    candidates = scored_terms[:60] 
+    
+    common_terms = filter_redundant_terms(candidates, top_k=3)
     
     if not common_terms: return ""
         
     summary = f"用户当前的偏好涉及{', '.join(common_terms)}等主题。"
     return summary
-
-class InvertedIndex:
-    def __init__(self, name):
-        self.name = name
-        self.index = defaultdict(list)
-        self.user_data = {} 
-        self.user_tokens = {}
-
-    def add_users(self, df, hist_col, target_col):
-        print(f"[{self.name}] Indexing {len(df)} users...")
-        for row in tqdm(df.itertuples(), total=len(df), desc=f"Indexing {self.name}"):
-            uid = row.Index
-            hist_raw = getattr(row, hist_col)
-            try:
-                hist_list = [int(x) for x in hist_raw] if hist_raw is not None else []
-            except:
-                hist_list = []
-            if not hist_list: continue
-            
-            matching_hist = hist_list[-MATCHING_HIST_LEN:]
-            tokens = set(matching_hist)
-            if not tokens: continue
-
-            tgt_raw = getattr(row, target_col)
-            try:
-                if isinstance(tgt_raw, (list, np.ndarray)):
-                    tgt = [int(x) for x in tgt_raw]
-                elif pd.notna(tgt_raw):
-                    tgt = [int(tgt_raw)]
-                else:
-                    tgt = []
-            except:
-                tgt = []
-
-            self.user_data[uid] = {'target': tgt, 'uid': row.uid}
-            self.user_tokens[uid] = tokens
-            for t in tokens:
-                self.index[t].append(uid)
-        print(f"[{self.name}] Done.")
-
-    def retrieve_similar(self, query_hist_list, query_uid, k=3, sample_limit=1000):
-        matching_query = query_hist_list[-MATCHING_HIST_LEN:]
-        query_tokens = set(matching_query)
-        if not query_tokens: return []
-
-        candidate_counts = defaultdict(int)
-        for t in query_tokens:
-            if t in self.index:
-                for uid in self.index[t]:
-                    if self.user_data[uid]['uid'] == query_uid:
-                        continue
-                    candidate_counts[uid] += 1
-        if not candidate_counts: return []
-
-        sorted_candidates = sorted(candidate_counts.items(), key=lambda x: x[1], reverse=True)[:sample_limit]
-        scored_users = []
-        for uid, intersection in sorted_candidates:
-            union = len(query_tokens) + len(self.user_tokens[uid]) - intersection
-            score = intersection / union if union > 0 else 0
-            recall = intersection / len(query_tokens) if len(query_tokens) > 0 else 0
-            
-            if score >= MIN_SIMILARITY_SCORE and recall < 0.8:
-                scored_users.append((uid, score))
-
-        scored_users.sort(key=lambda x: x[1], reverse=True)
-        best_users = scored_users[:k]
-        
-        results = []
-        for uid, score in best_users:
-            results.append(self.user_data[uid])
-        return results
 
 def process_messages(messages_json, summary_text):
     try:
@@ -288,21 +258,10 @@ def main():
     
     caption_map = load_captions(CAPTION_PATH)
     
-    print(f"Loading Source Data {SOURCE_TRAIN_PATH}...")
-    try:
-        df_source = pd.read_parquet(SOURCE_TRAIN_PATH)
-        df_train = df_source[df_source['split'] == 0].copy()
-    except Exception as e:
-        print(f"Failed to load train data: {e}")
-        return
-
-    indexes = {}
-    indexes['video'] = InvertedIndex("Video")
-    indexes['video'].add_users(df_train, 'hist_video_pid', 'target_video_pid')
-    indexes['ad'] = InvertedIndex("Ad")
-    indexes['ad'].add_users(df_train, 'hist_ad_pid', 'target_ad_pid')
-    indexes['product'] = InvertedIndex("Product")
-    indexes['product'].add_users(df_train, 'hist_goods_pid', 'target_goods_pid')
+    # Initialize IDF Calculator
+    idf_calc = IDFCalculator(caption_map, sample_size=50000)
+    
+    # No need to load df_train or build index for self-summary
 
     task_dirs = [d for d in os.listdir(BENCHMARK_BASE_DIR) if os.path.isdir(os.path.join(BENCHMARK_BASE_DIR, d))]
     
@@ -317,7 +276,6 @@ def main():
         os.makedirs(task_out, exist_ok=True)
         
         bench_hist_col = task_conf['bench_hist_col']
-        index = indexes[task_conf['index_type']]
         
         for fname in os.listdir(task_in):
             if not fname.endswith('.parquet'): continue
@@ -328,38 +286,20 @@ def main():
             try: df_bench = pd.read_parquet(f_in)
             except: continue
 
-            # For RAG, we process the FULL file if not limited by user request. 
-            # (If user wants limit, uncomment next line)
-            # df_bench = df_bench.head(10)
-
             new_msgs = []
             records = df_bench.to_dict('records')
             
-            for row in tqdm(records, desc=f"  RAG-Summary {fname}"):
-                q_uid = -1
-                try:
-                    meta = json.loads(row.get('metadata', '{}'))
-                    if 'uid' in meta: q_uid = meta['uid']
-                except: pass
-
+            for row in tqdm(records, desc=f"  Self-Summary {fname}"):
                 q_hist = row.get(bench_hist_col)
                 try:
                     q_hist_list = [int(x) for x in q_hist] if q_hist is not None else []
                 except:
                     q_hist_list = []
                 
-                similar_users = index.retrieve_similar(q_hist_list, q_uid, k=TOP_K_USERS)
+                # Use current user's most recent interactions
+                recent_items = q_hist_list[-MATCHING_HIST_LEN:]
                 
-                retrieved_pids = []
-                for user_data in similar_users:
-                    tgt = user_data.get('target')
-                    if tgt is None: continue
-                    if isinstance(tgt, (list, np.ndarray)):
-                        retrieved_pids.extend(tgt)
-                    else:
-                        retrieved_pids.append(tgt)
-                
-                summary = summarize_commonality(retrieved_pids, caption_map)
+                summary = summarize_commonality(recent_items, caption_map, idf_calc)
                 
                 orig_msg = row.get('messages')
                 if summary:

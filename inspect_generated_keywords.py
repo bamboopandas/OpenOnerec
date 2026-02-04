@@ -3,9 +3,9 @@ import json
 import os
 
 files = [
-    'raw_data/onerec_data/benchmark_data_1000_test_raganswersummary_v2/video/video_test.parquet',
-    'raw_data/onerec_data/benchmark_data_1000_test_raganswersummary_v2/product/product_test.parquet',
-    'raw_data/onerec_data/benchmark_data_1000_test_raganswersummary_v2/ad/ad_test.parquet'
+    'raw_data/onerec_data/benchmark_data_1000_test_self_latestitemsummary_v1/video/video_test.parquet',
+    'raw_data/onerec_data/benchmark_data_1000_test_self_latestitemsummary_v1/product/product_test.parquet',
+    'raw_data/onerec_data/benchmark_data_1000_test_self_latestitemsummary_v1/ad/ad_test.parquet'
 ]
 
 for f in files:

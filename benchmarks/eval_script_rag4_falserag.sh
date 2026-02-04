@@ -1,10 +1,9 @@
 
-# bash eval_script_rag4_falserag.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000_test_raganswersummary
+# bash eval_script_rag4_falserag.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000_test_self_latestitemsummary_v1
 
 # Set common variables
 MODEL_PATH=$1
-# VERSION="${VERSION:-v1.0_1000_thinktrue32}"
-VERSION="${VERSION:-v1.0_1000_thinkfalse_raganswersummary}"
+VERSION="${VERSION:-v1.0_1000_thinkfalse_latestitemsummary}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 
