@@ -169,9 +169,12 @@ class ADSHuggingFaceGenerator(Generator):
         temperature = kwargs.get("temperature", 0.0)
         
         # Pre-compute static tokens for reconstruction
-        prefix_text = " 证据是用户曾经交互过 "
+        prefix_text = " 对当前判断有帮助的用户历史交互为 "
+        separator_text = ", "
         suffix_text = "\n"
+        
         prefix_tokens = self.tokenizer.encode(prefix_text, add_special_tokens=False, return_tensors="pt").to(self.device)
+        separator_tokens = self.tokenizer.encode(separator_text, add_special_tokens=False, return_tensors="pt").to(self.device)
         suffix_tokens = self.tokenizer.encode(suffix_text, add_special_tokens=False, return_tensors="pt").to(self.device)
         
         total_samples = len(prompts)
@@ -188,9 +191,8 @@ class ADSHuggingFaceGenerator(Generator):
             generated_start_idx = input_ids.shape[1]
             last_ads_trigger_step = 0
             
-            # Store insertions: list of (insertion_index_relative_to_gen, item_idx)
-            # We store item_idx to resolve to actual tokens later
-            insertions = []
+            # Store all selected item indices
+            selected_item_indices = []
             
             with torch.no_grad():
                 for step in range(max_new_tokens):
@@ -243,19 +245,11 @@ class ADSHuggingFaceGenerator(Generator):
                             top_items = item_scores[:self.ads_top_k]
                             top_items.sort(key=lambda x: x[1])
                             
-                            # Record insertion for the first top item (Top-1 for now based on previous code)
-                            # Or loop if Top-K > 1? The previous code concatenated them.
-                            # "The evidence is that users like XX" for each selected item.
-                            
-                            insertion_point = all_ids.shape[1] - generated_start_idx + 1
-                            
-                            current_insertions = []
+                            # Collect items
                             for _, item_idx in top_items:
-                                current_insertions.append(item_idx)
+                                selected_item_indices.append(item_idx)
                                 
-                            if current_insertions:
-                                insertions.append((insertion_point, current_insertions))
-                                last_ads_trigger_step = step
+                            last_ads_trigger_step = step
                     
                     # Update context with ONLY the next token (Standard Autoregressive)
                     all_ids = torch.cat([all_ids, tokens_to_append], dim=1)
@@ -271,35 +265,33 @@ class ADSHuggingFaceGenerator(Generator):
                     if should_stop:
                         break
             
-            # --- RECONSTRUCTION (Resolving SIDs) ---
-            generated_only = all_ids[0, generated_start_idx:]
+            # --- RECONSTRUCTION (Single Sentence) ---
+            # 1. Deduplicate items while preserving order
+            unique_item_indices = []
+            seen = set()
+            for idx in selected_item_indices:
+                if idx not in seen:
+                    unique_item_indices.append(idx)
+                    seen.add(idx)
+            
             final_tokens_list = []
-            current_idx = 0
             
-            # insertions is sorted by insertion_point (ascending)
-            for point, item_indices in insertions:
-                # Append segment from last point to current point
-                if point > current_idx:
-                    final_tokens_list.append(generated_only[current_idx:point])
+            if unique_item_indices:
+                # Add Prefix
+                final_tokens_list.append(prefix_tokens[0])
                 
-                # Construct and append full evidence text for each selected item
-                for item_idx in item_indices:
-                    # Retrieve actual item tokens from input_ids
-                    start, end = item_ranges[item_idx]
-                    # Ensure indices are within bounds (they should be, as they come from input_ids)
-                    item_tokens_tensor = input_ids[0, start:end+1]
+                # Add Items separated by comma
+                for k, item_idx in enumerate(unique_item_indices):
+                    if k > 0:
+                        final_tokens_list.append(separator_tokens[0])
                     
-                    # [Prefix] + [Item Tokens] + [Suffix/Newline]
-                    # Note: prefix_tokens shape is [1, L], item_tokens_tensor is [L]
-                    full_insertion = torch.cat([prefix_tokens[0], item_tokens_tensor, suffix_tokens[0]])
-                    final_tokens_list.append(full_insertion)
+                    start, end = item_ranges[item_idx]
+                    item_tokens_tensor = input_ids[0, start:end+1]
+                    final_tokens_list.append(item_tokens_tensor)
                 
-                current_idx = point
+                # Add Suffix
+                final_tokens_list.append(suffix_tokens[0])
             
-            # Append remaining
-            if current_idx < len(generated_only):
-                final_tokens_list.append(generated_only[current_idx:])
-                
             if final_tokens_list:
                 final_token_tensor = torch.cat(final_tokens_list)
             else:

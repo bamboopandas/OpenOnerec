@@ -57,7 +57,7 @@ echo "Running all tasks with ADS Generator"
 PYTHON_EXEC="/home/lkzhang/miniconda3/envs/openonerec/bin/python3"
 
 # Common ADS arguments
-ADS_ARGS="--generator_type ads --ads_top_k 1 --sample_size 10"
+ADS_ARGS="--generator_type ads --ads_top_k 1 --sample_size 1"
 
 # Task: ad
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
