@@ -1,6 +1,7 @@
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
 import json
+import re
 from benchmark.console import *
 from utils.generator import RayVllmGenerator
 
@@ -8,9 +9,82 @@ class CompressedCoTGenerator(RayVllmGenerator):
     """
     Generator that implements a 3-stage process:
     1. Generate Chain-of-Thought (CoT).
-    2. Compress the CoT into a summary.
+    2. Compress the CoT into a summary (Heuristic Extraction).
     3. Generate final answer using Beam Search based on the compressed thought.
     """
+
+    def _extract_conclusion_heuristic(self, thought: str) -> str:
+        """
+        Extract the conclusion from the thought process using heuristics.
+        Logic:
+        1. Clean up tags.
+        2. Split into sentences.
+        3. Take the last non-empty sentence (conclusion).
+        4. If too short, append the one before it.
+        5. Strictly remove any Semantic ID markers.
+        6. Deduplicate keywords/phrases if present.
+        """
+        # 1. Clean up tags
+        text = thought.replace("<think>", "").replace("</think>", "").strip()
+        
+        # 2. Strictly remove Semantic ID patterns (just in case they exist in source thought)
+        # Pattern: <|sid_begin|>...<|sid_end|>
+        text = re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", "", text, flags=re.DOTALL)
+        # Also remove standalone tags
+        text = text.replace("<|sid_begin|>", "").replace("<|sid_end|>", "")
+        
+        # 3. Split into sentences (simple regex for Chinese/English punctuation)
+        # Split by . ? ! ; 。 ？ ！ ； 
+
+        sentences = re.split(r'([.。?!;；？！\n])', text)
+        
+        # Reconstruct sentences (delimiter is kept in odd positions)
+        clean_sentences = []
+        current = ""
+        for part in sentences:
+            if re.match(r'[.。?!;；？！\n]', part):
+                current += part
+                if current.strip():
+                    clean_sentences.append(current.strip())
+                current = ""
+            else:
+                current += part
+        if current.strip():
+            clean_sentences.append(current.strip())
+            
+        if not clean_sentences:
+            return "Based on user history."
+
+        # 4. Extract Conclusion (Last 1-2 sentences)
+        conclusion = clean_sentences[-1]
+        
+        # If conclusion is too short (e.g., just "Therefore."), prepend previous sentence
+        if len(conclusion) < 15 and len(clean_sentences) > 1:
+            conclusion = clean_sentences[-2] + " " + conclusion
+            
+        # 5. Intra-sentence deduplication (for repetitive keywords)
+        # Split by comma (Eng/Chi), semicolon, enumeration comma, or multiple spaces
+        # This handles: "A, A", "A A", "A; A", "A、A"
+        parts = re.split(r'[,，;；、\s]+', conclusion)
+        
+        seen = set()
+        deduped_parts = []
+        for p in parts:
+            p_clean = p.strip()
+            # Remove common list noise
+            p_clean = re.sub(r'^(and|or|with|和|以及|与|的)\s*$', '', p_clean)
+            # Remove punctuation at ends
+            p_clean = p_clean.strip('.。')
+            
+            if p_clean and len(p_clean) > 1 and p_clean.lower() not in [x.lower() for x in seen]:
+                seen.add(p_clean)
+                deduped_parts.append(p_clean)
+        
+        # Reconstruct if we actually had parts
+        if deduped_parts:
+            conclusion = ", ".join(deduped_parts)
+            
+        return conclusion
 
     def generate(
         self,
@@ -20,12 +94,12 @@ class CompressedCoTGenerator(RayVllmGenerator):
         """
         Three-stage generation:
         1. Generate thinking content.
-        2. Compress thinking content.
+        2. Compress thinking content (Heuristic).
         3. Generate final answer with beam search using compressed thinking.
         """
         
         console.print(
-            "\n[CompressedCoT] Starting 3-Stage Generation Process",
+            "\n[CompressedCoT] Starting 3-Stage Generation Process (Heuristic Mode)",
             style=head_style_2,
         )
 
@@ -42,66 +116,35 @@ class CompressedCoTGenerator(RayVllmGenerator):
         kwargs_stage1["num_beams"] = 1 # Use sampling for diversity in thinking
         kwargs_stage1["num_return_sequences"] = 1 # One thought per prompt for now
         
+        # Add repetition_penalty to discourage loops in source thought
+        kwargs_stage1["repetition_penalty"] = 1.1
+        
         # Call standard generation for Stage 1
-        # We use _generate_standard which distributes to workers
         stage1_results, _, stage1_mfu = self._generate_standard(prompts, **kwargs_stage1)
         
-        # --- Stage 2: Compress Thinking ---
+        # --- Stage 2: Compress Thinking (Heuristic) ---
         console.print(
-            "Stage 2/3: Compressing thinking content...",
+            "Stage 2/3: Compressing thinking content (Heuristic Extraction)...",
             style=warning_style,
         )
         
-        # Prepare prompts for summarization
-        # We ask the model to summarize the thought it just generated
-        summary_prompts = {}
-        # Map summary_id back to original_sample_id
-        summary_id_map = {} 
+        # We do NOT use the model here. We use Python logic.
+        stage2_results = {} # Map summary_id -> [summary_text]
+        summary_id_map = {}
         
-        debug_printed = False
         for sample_id, thoughts in stage1_results.items():
-            thought = thoughts[0] # Take the first thought
-            # Strip <think> tags if present (though stop might have handled end, start might be missing)
-            thought = thought.replace("<think>", "").replace("</think>", "").strip()
+            thought = thoughts[0]
             
-            if not thought:
-                thought = "No reasoning provided."
-
-            # Construct summarization prompt
-            # Note: This prompt format depends on the model's instruction tuning. 
-            # We use a generic one, assuming the model can handle it.
-            # Ideally, we should wrap this in a chat template if the model expects it.
-            # For now, we append instructions.
-            summary_prompt = (
-                f"以下是针对推荐任务的推理过程：\n\n"
-                f"{thought}\n\n"
-                f"请提炼出用户的核心意图以及最终推荐的关键理由。"
-                f"将其浓缩为一句极其简练的话（30字以内）。"
-                f"去除冗余背景，直击核心逻辑。\n"
-                f"简要总结："
-            )
-            
-            if not debug_printed:
-                console.print("\n[DEBUG] Example Summary Prompt:", style=warning_style)
-                console.print(summary_prompt)
-                console.print("-" * 50)
-                debug_printed = True
+            # Apply Heuristic
+            summary = self._extract_conclusion_heuristic(thought)
             
             summary_id = f"{sample_id}_summary"
-            summary_prompts[summary_id] = summary_prompt
+            stage2_results[summary_id] = [summary]
             summary_id_map[summary_id] = sample_id
 
-        # Configure kwargs for Stage 2 (Summarization)
-        kwargs_stage2 = kwargs.copy()
-        kwargs_stage2.pop("prompt_token", None) # Remove prompt_token to avoid triggering ID generation
-        kwargs_stage2["max_new_tokens"] = 256 # Short summary
-        kwargs_stage2["stop"] = ["<|sid_begin|>"] # Strictly stop if it tries to generate SIDs
-        kwargs_stage2["num_beams"] = 1
-        kwargs_stage2["num_return_sequences"] = 1
-        kwargs_stage2["temperature"] = 0.2 # Low temp for deterministic summary
-        
-        stage2_results, _, stage2_mfu = self._generate_standard(summary_prompts, **kwargs_stage2)
-        
+        # No MFU for Stage 2 since it's CPU logic
+        stage2_mfu = {}
+
         # --- Stage 3: Beam Search with Compressed Thought ---
         console.print(
             "Stage 3/3: Generating final answer with Beam Search...",
@@ -109,6 +152,7 @@ class CompressedCoTGenerator(RayVllmGenerator):
         )
         
         final_prompts = {}
+        prompt_token = kwargs.get("prompt_token", "")
         
         for summary_id, summaries in stage2_results.items():
             sample_id = summary_id_map[summary_id]
@@ -116,24 +160,16 @@ class CompressedCoTGenerator(RayVllmGenerator):
             original_prompt = prompts[sample_id]
             
             # Construct final prompt
-            # We inject the compressed thought as if it was a <think> block or context
-            # We use a specific marker so we can potentially strip it later or just leave it
-            # Using <compressed_thought> tag for clarity
-            
-            # Check if we should use the prompt_token (e.g., "Response:")
-            prompt_token = kwargs.get("prompt_token", "")
-            
+            # Injecting compressed thought
             final_prompt = (
                 f"{original_prompt}"
-                f"<think>Summary of reasoning: {summary}</think>\n"
+                f"<think>{summary}</think>\n"
                 f"{prompt_token}"
             )
             final_prompts[sample_id] = final_prompt
 
         # Configure kwargs for Stage 3 (Beam Search)
         kwargs_stage3 = kwargs.copy()
-        # Restore original beam settings
-        # The user requested "multiple beam searches", implies using beam search here
         kwargs_stage3["num_beams"] = kwargs.get("num_beams", 4) 
         kwargs_stage3["num_return_sequences"] = kwargs.get("num_return_sequences", kwargs_stage3["num_beams"])
         kwargs_stage3["max_new_tokens"] = kwargs.get("max_new_tokens", 128)
@@ -141,25 +177,13 @@ class CompressedCoTGenerator(RayVllmGenerator):
         stage3_results, stage3_logprobs, stage3_mfu = self._generate_standard(final_prompts, **kwargs_stage3)
         
         # --- Prepend Compressed Thought to Results ---
-        # stage3_results currently contains ONLY the answer (because the prompt is stripped).
-        # We need to prepend "<think>Summary...</think>\n{prompt_token}" to it.
-        
         final_results = {}
-        prompt_token = kwargs.get("prompt_token", "")
         
         for sample_id, answers in stage3_results.items():
-            # Get the summary for this sample
-            # Find summary_id for this sample_id
-            # Invert summary_id_map or just reconstruct ID
             summary_id = f"{sample_id}_summary"
             summary = stage2_results[summary_id][0].strip()
             
-            # Clean up the summary by removing common prefixes
-            for prefix_to_strip in ["简要总结：", "简要总结:", "Summary:", "Summary of reasoning:", "总结：", "总结:"]:
-                if summary.startswith(prefix_to_strip):
-                    summary = summary[len(prefix_to_strip):].strip()
-            
-            # Construct the prefix - removed the hardcoded "Summary of reasoning:"
+            # Construct the prefix
             prefix = f"<think>{summary}</think>\n{prompt_token}"
             
             # Prepend to all beam answers
@@ -170,12 +194,10 @@ class CompressedCoTGenerator(RayVllmGenerator):
             final_results[sample_id] = final_answers
         
         # --- Aggregate Results & MFU ---
-        # Combine MFU stats
         final_mfu_stats = defaultdict(lambda: {"input_tokens": [], "output_tokens": [], "times": []})
         
-        for stage_stats in [stage1_mfu, stage2_mfu, stage3_mfu]:
+        for stage_stats in [stage1_mfu, stage3_mfu]: # Skip stage2
             for sid, stats in stage_stats.items():
-                # Map summary IDs back to original sample IDs
                 real_sid = sid
                 if "_summary" in sid:
                     real_sid = summary_id_map.get(sid, sid)
