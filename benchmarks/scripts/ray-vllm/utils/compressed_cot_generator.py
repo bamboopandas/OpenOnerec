@@ -1,62 +1,45 @@
+#v2
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
 import json
 import re
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
-
 from benchmark.console import *
 from utils.generator import RayVllmGenerator
 
 class CompressedCoTGenerator(RayVllmGenerator):
     """
     Generator that implements a 3-stage process:
-    1. Generate Chain-of-Thought (CoT) using Main Model (OneRec).
-    2. Compress the CoT into a summary using a Secondary Model (generic Qwen).
-    3. Generate final answer using Beam Search (Main Model) based on the compressed thought.
+    1. Generate Chain-of-Thought (CoT).
+    2. Compress the CoT into a summary (Heuristic Extraction).
+    3. Generate final answer using Beam Search based on the compressed thought.
     """
-    
-    def __init__(self, *args, **kwargs):
-        # Extract summarizer_model_path before calling super().__init__
-        self.summarizer_model_path = kwargs.pop('summarizer_model_path', None)
-        
-        super().__init__(*args, **kwargs)
-        
-        # Initialize Summarizer Model
-        if self.summarizer_model_path:
-            console.print(f"\n[CompressedCoT] Loading Summarizer Model from: {self.summarizer_model_path}", style=warning_style)
-            try:
-                # Load on the same GPU as the main process (usually GPU 0 or specified)
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                
-                self.summ_tokenizer = AutoTokenizer.from_pretrained(self.summarizer_model_path, trust_remote_code=True)
-                
-                # Ensure pad token is set for batching
-                if self.summ_tokenizer.pad_token is None:
-                    self.summ_tokenizer.pad_token = self.summ_tokenizer.eos_token
-                    
-                self.summ_model = AutoModelForCausalLM.from_pretrained(
-                    self.summarizer_model_path, 
-                    trust_remote_code=True, 
-                    torch_dtype=torch.bfloat16,
-                    device_map="auto" # Let HF decide placement
-                )
-                self.summ_model.eval()
-                console.print("[CompressedCoT] Summarizer Model Loaded Successfully.", style=success_style)
-            except Exception as e:
-                console.print(f"[CompressedCoT] Failed to load summarizer model: {e}", style=err_style)
-                self.summ_model = None
-        else:
-            console.print("[CompressedCoT] No summarizer_model_path provided. Will use Heuristic Fallback.", style=warning_style)
-            self.summ_model = None
 
     def _extract_conclusion_heuristic(self, thought: str) -> str:
-        """Fallback heuristic if model fails or is not provided"""
+        """
+        Extract the conclusion from the thought process using heuristics.
+        Logic:
+        1. Clean up tags.
+        2. Split into sentences.
+        3. Take the last non-empty sentence (conclusion).
+        4. If too short, append the one before it.
+        5. Strictly remove any Semantic ID markers.
+        6. Deduplicate keywords/phrases if present.
+        """
+        # 1. Clean up tags
         text = thought.replace("<think>", "").replace("</think>", "").strip()
+        
+        # 2. Strictly remove Semantic ID patterns (just in case they exist in source thought)
+        # Pattern: <|sid_begin|>...<|sid_end|>
         text = re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", "", text, flags=re.DOTALL)
+        # Also remove standalone tags
         text = text.replace("<|sid_begin|>", "").replace("<|sid_end|>", "")
+        
+        # 3. Split into sentences (simple regex for Chinese/English punctuation)
+        # Split by . ? ! ; 。 ？ ！ ； 
+
         sentences = re.split(r'([.。?!;；？！\n])', text)
+        
+        # Reconstruct sentences (delimiter is kept in odd positions)
         clean_sentences = []
         current = ""
         for part in sentences:
@@ -69,168 +52,103 @@ class CompressedCoTGenerator(RayVllmGenerator):
                 current += part
         if current.strip():
             clean_sentences.append(current.strip())
+            
         if not clean_sentences:
             return "Based on user history."
+
+        # 4. Extract Conclusion (Last 1-2 sentences)
         conclusion = clean_sentences[-1]
+        
+        # If conclusion is too short (e.g., just "Therefore."), prepend previous sentence
         if len(conclusion) < 15 and len(clean_sentences) > 1:
             conclusion = clean_sentences[-2] + " " + conclusion
+            
+        # 5. Intra-sentence deduplication (for repetitive keywords)
+        # Split by comma (Eng/Chi), semicolon, enumeration comma, or multiple spaces
+        # This handles: "A, A", "A A", "A; A", "A、A"
+        parts = re.split(r'[,，;；、\s]+', conclusion)
+        
+        seen = set()
+        deduped_parts = []
+        for p in parts:
+            p_clean = p.strip()
+            # Remove common list noise
+            p_clean = re.sub(r'^(and|or|with|和|以及|与|的)\s*$', '', p_clean)
+            # Remove punctuation at ends
+            p_clean = p_clean.strip('.。')
+            
+            if p_clean and len(p_clean) > 1 and p_clean.lower() not in [x.lower() for x in seen]:
+                seen.add(p_clean)
+                deduped_parts.append(p_clean)
+        
+        # Reconstruct if we actually had parts
+        if deduped_parts:
+            conclusion = ", ".join(deduped_parts)
+            
         return conclusion
-
-    def _generate_summary_with_model(self, thoughts: List[str], batch_size: int = 32) -> List[str]:
-        """Generate summaries using the secondary Qwen model with batching"""
-        summaries = []
-        prompts = []
-        
-        # 1. Prepare all prompts
-        for thought in thoughts:
-            # Clean thought
-            clean_thought = thought.replace("<think>", "").replace("</think>", "").strip()
-            clean_thought = re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", "", clean_thought, flags=re.DOTALL)
-            
-            messages = [
-                {"role": "system", "content": "你是一个严格的总结助手。请直接输出结果，不要包含“好的”、“明白”、“以下是总结”等任何废话。"},
-                # {"role": "user", "content": f"以下是一段关于推荐任务的推理过程：\n\n{clean_thought}\n\n请提取核心偏好和推荐理由。\n\n总结："}
-                {"role": "user", "content": f"以下是一段关于推荐任务的推理过程：\n\n{clean_thought}\n\n请提取核心偏好和推荐理由，控制在50字以内。\n\n总结："}
-            ]
-
-            try:
-                text = self.summ_tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
-                )
-            except:
-                # Fallback format
-                text = f"System: 你是一个严格的总结助手。\nUser: 以下是一段推理：{clean_thought}\n请提取核心偏好。\nAssistant:"
-            
-            prompts.append(text)
-
-        # 2. Process in batches
-        total_prompts = len(prompts)
-        console.print(f"Summarizing {total_prompts} thoughts in batches of {batch_size}...", style=warning_style)
-        
-        for i in range(0, total_prompts, batch_size):
-            batch_prompts = prompts[i:i + batch_size]
-            
-            # Tokenize batch
-            # padding='longest' pads to the length of the longest sequence in the batch
-            inputs = self.summ_tokenizer(
-                batch_prompts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=4096 # Safety limit for context
-            ).to(self.summ_model.device)
-            
-            with torch.no_grad():
-                generated_ids = self.summ_model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False, # Deterministic summary
-                    temperature=0.1,
-                    pad_token_id=self.summ_tokenizer.pad_token_id
-                )
-            
-            # Extract only the generated part
-            # With left padding, the new tokens are strictly appended at the end
-            input_len = inputs.input_ids.shape[1]
-            new_tokens = generated_ids[:, input_len:]
-            
-            decoded_batch = self.summ_tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-            
-            for summary in decoded_batch:
-                cleaned_summary = summary.strip()
-                # Heuristic Cleaning of Meta-talk
-                # Remove common prefixes like "Okay, I will...", "Here is the summary:", etc.
-                prefixes_to_clean = [
-                    "Okay,", "Okay.", "Sure,", "Sure.", "Certainly,", "Certainly.",
-                    "Here is", "Here's", "Based on", "To summarize", "In summary",
-                    "好的，", "好的。", "明白，", "没问题，", "以下是", "根据", "总结如下"
-                ]
-                
-                # Simple check: if starts with prefix, try to find the actual start
-                for p in prefixes_to_clean:
-                    if cleaned_summary.lower().startswith(p.lower()):
-                        # Try to split by punctuation (colon, comma, newline)
-                        parts = re.split(r'[:：\n]', cleaned_summary, 1)
-                        if len(parts) > 1:
-                            cleaned_summary = parts[1].strip()
-                        else:
-                            # Just remove the prefix
-                            cleaned_summary = cleaned_summary[len(p):].strip()
-                summaries.append(cleaned_summary)
-            
-        return summaries
 
     def generate(
         self,
         prompts: Dict[str, str],
         **kwargs
     ) -> tuple:
+        """
+        Three-stage generation:
+        1. Generate thinking content.
+        2. Compress thinking content (Heuristic).
+        3. Generate final answer with beam search using compressed thinking.
+        """
         
         console.print(
-            "\n[CompressedCoT] Starting 3-Stage Generation Process (Dual-Model Mode)",
+            "\n[CompressedCoT] Starting 3-Stage Generation Process (Heuristic Mode)",
             style=head_style_2,
         )
 
         # --- Stage 1: Generate Thinking (CoT) ---
         console.print(
-            "Stage 1/3: Generating thinking content (Main Model)...",
+            "Stage 1/3: Generating thinking content (CoT)...",
             style=warning_style,
         )
         
+        # Configure kwargs for Stage 1
         kwargs_stage1 = kwargs.copy()
         kwargs_stage1["stop"] = ["</think>"]
         kwargs_stage1["max_new_tokens"] = kwargs.get("max_new_thinking_tokens", 1024)
-        kwargs_stage1["num_beams"] = 1
-        kwargs_stage1["num_return_sequences"] = 1
+        kwargs_stage1["num_beams"] = 1 # Use sampling for diversity in thinking
+        kwargs_stage1["num_return_sequences"] = 1 # One thought per prompt for now
+        
+        # Add repetition_penalty to discourage loops in source thought
         kwargs_stage1["repetition_penalty"] = 1.1
         
+        # Call standard generation for Stage 1
         stage1_results, _, stage1_mfu = self._generate_standard(prompts, **kwargs_stage1)
         
-        # --- Stage 2: Compress Thinking (Secondary Model) ---
+        # --- Stage 2: Compress Thinking (Heuristic) ---
         console.print(
-            "Stage 2/3: Compressing thinking content...",
+            "Stage 2/3: Compressing thinking content (Heuristic Extraction)...",
             style=warning_style,
         )
         
-        stage2_results = {}
+        # We do NOT use the model here. We use Python logic.
+        stage2_results = {} # Map summary_id -> [summary_text]
         summary_id_map = {}
         
-        # Collect all thoughts
-        all_sample_ids = []
-        all_thoughts = []
-        
         for sample_id, thoughts in stage1_results.items():
-            all_sample_ids.append(sample_id)
-            all_thoughts.append(thoughts[0])
+            thought = thoughts[0]
             
-        if self.summ_model:
-            # Use Model
-            # Set padding side to left for generation
-            original_padding_side = self.summ_tokenizer.padding_side
-            self.summ_tokenizer.padding_side = 'left'
+            # Apply Heuristic
+            summary = self._extract_conclusion_heuristic(thought)
             
-            # Implement batch logic inside this call or separate method
-            summaries = self._generate_summary_with_model_batched(all_thoughts, batch_size=8)
-            
-            # Restore padding side
-            self.summ_tokenizer.padding_side = original_padding_side
-        else:
-            # Use Heuristic Fallback
-            console.print("[CompressedCoT] Using Heuristic Fallback for summarization.", style=warning_style)
-            summaries = [self._extract_conclusion_heuristic(t) for t in all_thoughts]
-            
-        for i, sample_id in enumerate(all_sample_ids):
             summary_id = f"{sample_id}_summary"
-            stage2_results[summary_id] = [summaries[i]]
+            stage2_results[summary_id] = [summary]
             summary_id_map[summary_id] = sample_id
 
-        stage2_mfu = {} # No MFU tracking for local secondary model for now
+        # No MFU for Stage 2 since it's CPU logic
+        stage2_mfu = {}
 
         # --- Stage 3: Beam Search with Compressed Thought ---
         console.print(
-            "Stage 3/3: Generating final answer with Beam Search (Main Model)...",
+            "Stage 3/3: Generating final answer with Beam Search...",
             style=warning_style,
         )
         
@@ -242,6 +160,8 @@ class CompressedCoTGenerator(RayVllmGenerator):
             summary = summaries[0].strip()
             original_prompt = prompts[sample_id]
             
+            # Construct final prompt
+            # Injecting compressed thought
             final_prompt = (
                 f"{original_prompt}"
                 f"<think>{summary}</think>\n"
@@ -249,6 +169,7 @@ class CompressedCoTGenerator(RayVllmGenerator):
             )
             final_prompts[sample_id] = final_prompt
 
+        # Configure kwargs for Stage 3 (Beam Search)
         kwargs_stage3 = kwargs.copy()
         kwargs_stage3["num_beams"] = kwargs.get("num_beams", 4) 
         kwargs_stage3["num_return_sequences"] = kwargs.get("num_return_sequences", kwargs_stage3["num_beams"])
@@ -263,8 +184,10 @@ class CompressedCoTGenerator(RayVllmGenerator):
             summary_id = f"{sample_id}_summary"
             summary = stage2_results[summary_id][0].strip()
             
+            # Construct the prefix
             prefix = f"<think>{summary}</think>\n{prompt_token}"
             
+            # Prepend to all beam answers
             final_answers = []
             for ans in answers:
                 final_answers.append(prefix + ans)
@@ -274,7 +197,7 @@ class CompressedCoTGenerator(RayVllmGenerator):
         # --- Aggregate Results & MFU ---
         final_mfu_stats = defaultdict(lambda: {"input_tokens": [], "output_tokens": [], "times": []})
         
-        for stage_stats in [stage1_mfu, stage3_mfu]:
+        for stage_stats in [stage1_mfu, stage3_mfu]: # Skip stage2
             for sid, stats in stage_stats.items():
                 real_sid = sid
                 if "_summary" in sid:
@@ -290,87 +213,3 @@ class CompressedCoTGenerator(RayVllmGenerator):
         self.mfu_stats = final_mfu_stats
         
         return final_results, stage3_logprobs
-
-    def _generate_summary_with_model_batched(self, thoughts: List[str], batch_size: int = 32) -> List[str]:
-        """Generate summaries using the secondary Qwen model with batching"""
-        summaries = []
-        prompts = []
-        
-        # 1. Prepare all prompts
-        for thought in thoughts:
-            clean_thought = thought.replace("<think>", "").replace("</think>", "").strip()
-            clean_thought = re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", "", clean_thought, flags=re.DOTALL)
-            
-            messages = [
-                {"role": "system", "content": "你是一个严格的总结助手。请直接输出结果，不要包含任何废话。"},
-                {"role": "user", "content": f"以下是一段关于推荐任务的推理过程：\n\n{clean_thought}\n\n请先总结用户当前偏好的关键词，然后将这些关键词串联成一句通顺的话，作为新的推理思路。\n请直接输出这句话，不要包含“关键词是”或“这句话是”等前缀，不要输出你的思考过程。\n\n当前用户偏好是："}
-            ]
-
-            try:
-                text = self.summ_tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
-                )
-            except:
-                text = f"System: 你是一个严格的总结助手。\nUser: 以下是一段推理：{clean_thought}\n请提取核心偏好。\nAssistant:"
-            
-            prompts.append(text)
-
-        # 2. Process in batches
-        total_prompts = len(prompts)
-        console.print(f"Summarizing {total_prompts} thoughts in batches of {batch_size}...", style=warning_style)
-        
-        # Ensure left padding
-        self.summ_tokenizer.padding_side = 'left'
-        
-        for i in tqdm(range(0, total_prompts, batch_size), desc="Summarizing"):
-            batch_prompts = prompts[i:i + batch_size]
-            
-            inputs = self.summ_tokenizer(
-                batch_prompts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=4096 
-            ).to(self.summ_model.device)
-            
-            with torch.no_grad():
-                generated_ids = self.summ_model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False, 
-                    temperature=0.1,
-                    pad_token_id=self.summ_tokenizer.pad_token_id
-                )
-            
-            # Extract only the generated part
-            # With left padding, the new tokens are strictly appended at the end
-            input_len = inputs.input_ids.shape[1]
-            new_tokens = generated_ids[:, input_len:]
-            
-            decoded_batch = self.summ_tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-            
-            for summary in decoded_batch:
-                cleaned_summary = summary.strip()
-                # Heuristic Cleaning of Meta-talk
-                # Remove common prefixes like "Okay, I will...", "Here is the summary:", etc.
-                prefixes_to_clean = [
-                    "Okay,", "Okay.", "Sure,", "Sure.", "Certainly,", "Certainly.",
-                    "Here is", "Here's", "Based on", "To summarize", "In summary",
-                    "好的，", "好的。", "明白，", "没问题，", "以下是", "根据", "总结如下"
-                ]
-                
-                # Simple check: if starts with prefix, try to find the actual start
-                for p in prefixes_to_clean:
-                    if cleaned_summary.lower().startswith(p.lower()):
-                        # Try to split by punctuation (colon, comma, newline)
-                        parts = re.split(r'[:：\n]', cleaned_summary, 1)
-                        if len(parts) > 1:
-                            cleaned_summary = parts[1].strip()
-                        else:
-                            # Just remove the prefix
-                            cleaned_summary = cleaned_summary[len(p):].strip()
-                summaries.append(cleaned_summary)
-            
-        return summaries
