@@ -61,7 +61,8 @@ def main():
         force_enable_optimizations=inference_config.force_enable_optimizations,
         force_disable_optimizations=inference_config.force_disable_optimizations,
         worker_batch_size=inference_config.worker_batch_size,
-        task_types=benchmark_config.task_types
+        task_types=benchmark_config.task_types,
+        summarizer_model_path=inference_config.summarizer_model_path  # Pass summarizer model path
     )
 
     # 3. Generate text

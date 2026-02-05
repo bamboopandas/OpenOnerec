@@ -3,8 +3,9 @@ import sys
 from huggingface_hub import snapshot_download
 
 # ================= 配置区域 =================
-MODEL_ID = "Qwen/Qwen3-0.6B"
-LOCAL_DIR = "/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/code/onerec_pretrain/hf_models/Qwen3-0.6B"
+MODEL_ID = "Qwen/Qwen3-1.7B"
+LOCAL_DIR = "/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/data/code/onerec_pretrain/hf_models/Qwen3-1.7B-norec"
+# LOCAL_DIR = "/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/code/onerec_pretrain/hf_models/Qwen3-0.6B"
 HF_MIRROR_URL = "https://hf-mirror.com"
 PROXY_URL = "http://192.168.1.99:7890"
 # ===========================================

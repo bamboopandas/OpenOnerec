@@ -93,6 +93,10 @@ class InferenceConfig:
         default=256,
         metadata={"help": "Maximum number of sequences per iteration"}
     )
+    summarizer_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the generic model used for summarization in Compressed CoT"}
+    )
 
 
 @dataclass
