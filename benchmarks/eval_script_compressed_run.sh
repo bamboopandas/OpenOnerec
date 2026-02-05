@@ -5,7 +5,7 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_compressed_cot_v3}"
+VERSION="${VERSION:-v1.0_compressed_cot_v3.1}"
 ENABLE_THINKING=${3:-true}
 CUSTOM_DATA_DIR=$4
 
@@ -57,12 +57,12 @@ SUMMARIZER_MODEL="/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/data/code/on
 # generator_type is ignored by evaluate_compressed.py but we keep it for consistency
 # sample_size 1 is inherited from ads script example, can be changed
 # We use num_beams 4 for the final stage (Stage 3), and num_return_sequences 4
-ARGS="--generator_type compressed_cot --summarizer_model_path $SUMMARIZER_MODEL  --sample_size 1000"
+ARGS="--generator_type compressed_cot --summarizer_model_path $SUMMARIZER_MODEL --sample_size 1000"
 
 # Task: ad
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types ad \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -79,7 +79,7 @@ echo "Ad task completed successfully"
 # Task: product
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types product \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -96,7 +96,7 @@ echo "Product task completed successfully"
 # Task: video
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types video \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -113,7 +113,7 @@ echo "Video task completed successfully"
 # Task: rec_reason
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types rec_reason \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -130,7 +130,7 @@ echo "Rec_reason task completed successfully"
 # Task: item_understand
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types item_understand \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -147,7 +147,7 @@ echo "Item_understand task completed successfully"
 # Task: label_cond
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types label_cond \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -164,7 +164,7 @@ echo "Label_cond task completed successfully"
 # Task: interactive
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types interactive \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -181,7 +181,7 @@ echo "Interactive task completed successfully"
 # Task: label_pred
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
     --num_gpus 1 \
-    --gpu_ids 2 \
+    --gpu_ids 4 \
     --task_types label_pred \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \

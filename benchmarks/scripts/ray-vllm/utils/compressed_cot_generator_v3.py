@@ -4,7 +4,6 @@ import json
 import re
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
 
 from benchmark.console import *
 from utils.generator import RayVllmGenerator
@@ -28,14 +27,16 @@ class CompressedCoTGenerator(RayVllmGenerator):
             console.print(f"\n[CompressedCoT] Loading Summarizer Model from: {self.summarizer_model_path}", style=warning_style)
             try:
                 # Load on the same GPU as the main process (usually GPU 0 or specified)
+                # If using Ray, this process is the driver. The workers hold the vLLM model.
+                # So loading a small model here is fine if there is VRAM.
+                # Ideally, we should check available devices. 
+                # Assuming single-node, we use "cuda:0" or similar. 
+                # Check gpu_ids from kwargs if passed to RayVllmGenerator, but it consumes them.
+                # We will try to find a free GPU or just use cuda:0. 
+                
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 
                 self.summ_tokenizer = AutoTokenizer.from_pretrained(self.summarizer_model_path, trust_remote_code=True)
-                
-                # Ensure pad token is set for batching
-                if self.summ_tokenizer.pad_token is None:
-                    self.summ_tokenizer.pad_token = self.summ_tokenizer.eos_token
-                    
                 self.summ_model = AutoModelForCausalLM.from_pretrained(
                     self.summarizer_model_path, 
                     trust_remote_code=True, 
@@ -76,22 +77,26 @@ class CompressedCoTGenerator(RayVllmGenerator):
             conclusion = clean_sentences[-2] + " " + conclusion
         return conclusion
 
-    def _generate_summary_with_model(self, thoughts: List[str], batch_size: int = 32) -> List[str]:
-        """Generate summaries using the secondary Qwen model with batching"""
+    def _generate_summary_with_model(self, thoughts: List[str]) -> List[str]:
+        """Generate summaries using the secondary Qwen model"""
         summaries = []
-        prompts = []
         
-        # 1. Prepare all prompts
+        # Batching could be implemented, but doing sequential for simplicity/safety first
         for thought in thoughts:
             # Clean thought
             clean_thought = thought.replace("<think>", "").replace("</think>", "").strip()
             clean_thought = re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", "", clean_thought, flags=re.DOTALL)
+            
+            # Construct Prompt (Chinese)
+            # Qwen chat template usually: <|im_start|>system\n...<|im_end|><|im_start|>user\n...<|im_end|><|im_start|>assistant\n
+            # We will use apply_chat_template if available, or raw string
             
             messages = [
                 {"role": "system", "content": "你是一个严格的总结助手。请直接输出结果，不要包含“好的”、“明白”、“以下是总结”等任何废话。"},
                 # {"role": "user", "content": f"以下是一段关于推荐任务的推理过程：\n\n{clean_thought}\n\n请提取核心偏好和推荐理由。\n\n总结："}
                 {"role": "user", "content": f"以下是一段关于推荐任务的推理过程：\n\n{clean_thought}\n\n请提取核心偏好和推荐理由，控制在50字以内。\n\n总结："}
             ]
+            
 
             try:
                 text = self.summ_tokenizer.apply_chat_template(
@@ -102,63 +107,44 @@ class CompressedCoTGenerator(RayVllmGenerator):
             except:
                 # Fallback format
                 text = f"System: 你是一个严格的总结助手。\nUser: 以下是一段推理：{clean_thought}\n请提取核心偏好。\nAssistant:"
-            
-            prompts.append(text)
 
-        # 2. Process in batches
-        total_prompts = len(prompts)
-        console.print(f"Summarizing {total_prompts} thoughts in batches of {batch_size}...", style=warning_style)
-        
-        for i in range(0, total_prompts, batch_size):
-            batch_prompts = prompts[i:i + batch_size]
-            
-            # Tokenize batch
-            # padding='longest' pads to the length of the longest sequence in the batch
-            inputs = self.summ_tokenizer(
-                batch_prompts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=4096 # Safety limit for context
-            ).to(self.summ_model.device)
+            inputs = self.summ_tokenizer([text], return_tensors="pt").to(self.summ_model.device)
             
             with torch.no_grad():
                 generated_ids = self.summ_model.generate(
                     **inputs,
                     max_new_tokens=256,
                     do_sample=False, # Deterministic summary
-                    temperature=0.1,
-                    pad_token_id=self.summ_tokenizer.pad_token_id
+                    temperature=0.1
                 )
             
-            # Extract only the generated part
-            # With left padding, the new tokens are strictly appended at the end
-            input_len = inputs.input_ids.shape[1]
-            new_tokens = generated_ids[:, input_len:]
+            # Decode
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            summary = self.summ_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
             
-            decoded_batch = self.summ_tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+            # Heuristic Cleaning of Meta-talk
+            # Remove common prefixes like "Okay, I will...", "Here is the summary:", etc.
+            prefixes_to_clean = [
+                "Okay,", "Okay.", "Sure,", "Sure.", "Certainly,", "Certainly.",
+                "Here is", "Here's", "Based on", "To summarize", "In summary",
+                "好的，", "好的。", "明白，", "没问题，", "以下是", "根据", "总结如下"
+            ]
             
-            for summary in decoded_batch:
-                cleaned_summary = summary.strip()
-                # Heuristic Cleaning of Meta-talk
-                # Remove common prefixes like "Okay, I will...", "Here is the summary:", etc.
-                prefixes_to_clean = [
-                    "Okay,", "Okay.", "Sure,", "Sure.", "Certainly,", "Certainly.",
-                    "Here is", "Here's", "Based on", "To summarize", "In summary",
-                    "好的，", "好的。", "明白，", "没问题，", "以下是", "根据", "总结如下"
-                ]
-                
-                # Simple check: if starts with prefix, try to find the actual start
-                for p in prefixes_to_clean:
-                    if cleaned_summary.lower().startswith(p.lower()):
-                        # Try to split by punctuation (colon, comma, newline)
-                        parts = re.split(r'[:：\n]', cleaned_summary, 1)
-                        if len(parts) > 1:
-                            cleaned_summary = parts[1].strip()
-                        else:
-                            # Just remove the prefix
-                            cleaned_summary = cleaned_summary[len(p):].strip()
-                summaries.append(cleaned_summary)
+            # Simple check: if starts with prefix, try to find the actual start
+            cleaned_summary = summary
+            for p in prefixes_to_clean:
+                if cleaned_summary.lower().startswith(p.lower()):
+                    # Try to split by punctuation (colon, comma, newline)
+                    parts = re.split(r'[:：\n]', cleaned_summary, 1)
+                    if len(parts) > 1:
+                        cleaned_summary = parts[1].strip()
+                    else:
+                        # Just remove the prefix
+                        cleaned_summary = cleaned_summary[len(p):].strip()
+            
+            summaries.append(cleaned_summary)
             
         return summaries
 
@@ -207,15 +193,7 @@ class CompressedCoTGenerator(RayVllmGenerator):
             
         if self.summ_model:
             # Use Model
-            # Set padding side to left for generation
-            original_padding_side = self.summ_tokenizer.padding_side
-            self.summ_tokenizer.padding_side = 'left'
-            
-            # Implement batch logic inside this call or separate method
-            summaries = self._generate_summary_with_model_batched(all_thoughts, batch_size=8)
-            
-            # Restore padding side
-            self.summ_tokenizer.padding_side = original_padding_side
+            summaries = self._generate_summary_with_model(all_thoughts)
         else:
             # Use Heuristic Fallback
             console.print("[CompressedCoT] Using Heuristic Fallback for summarization.", style=warning_style)
@@ -290,87 +268,3 @@ class CompressedCoTGenerator(RayVllmGenerator):
         self.mfu_stats = final_mfu_stats
         
         return final_results, stage3_logprobs
-
-    def _generate_summary_with_model_batched(self, thoughts: List[str], batch_size: int = 32) -> List[str]:
-        """Generate summaries using the secondary Qwen model with batching"""
-        summaries = []
-        prompts = []
-        
-        # 1. Prepare all prompts
-        for thought in thoughts:
-            clean_thought = thought.replace("<think>", "").replace("</think>", "").strip()
-            clean_thought = re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", "", clean_thought, flags=re.DOTALL)
-            
-            messages = [
-                {"role": "system", "content": "你是一个严格的总结助手。请直接输出结果，不要包含任何废话。"},
-                {"role": "user", "content": f"以下是一段关于推荐任务的推理过程：\n\n{clean_thought}\n\n请先总结用户当前偏好的关键词，然后将这些关键词串联成一句通顺的话，作为新的推理思路。\n请直接输出这句话，不要包含“关键词是”或“这句话是”等前缀，不要输出你的思考过程。\n\n当前用户偏好是："}
-            ]
-
-            try:
-                text = self.summ_tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
-                )
-            except:
-                text = f"System: 你是一个严格的总结助手。\nUser: 以下是一段推理：{clean_thought}\n请提取核心偏好。\nAssistant:"
-            
-            prompts.append(text)
-
-        # 2. Process in batches
-        total_prompts = len(prompts)
-        console.print(f"Summarizing {total_prompts} thoughts in batches of {batch_size}...", style=warning_style)
-        
-        # Ensure left padding
-        self.summ_tokenizer.padding_side = 'left'
-        
-        for i in tqdm(range(0, total_prompts, batch_size), desc="Summarizing"):
-            batch_prompts = prompts[i:i + batch_size]
-            
-            inputs = self.summ_tokenizer(
-                batch_prompts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=4096 
-            ).to(self.summ_model.device)
-            
-            with torch.no_grad():
-                generated_ids = self.summ_model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False, 
-                    temperature=0.1,
-                    pad_token_id=self.summ_tokenizer.pad_token_id
-                )
-            
-            # Extract only the generated part
-            # With left padding, the new tokens are strictly appended at the end
-            input_len = inputs.input_ids.shape[1]
-            new_tokens = generated_ids[:, input_len:]
-            
-            decoded_batch = self.summ_tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-            
-            for summary in decoded_batch:
-                cleaned_summary = summary.strip()
-                # Heuristic Cleaning of Meta-talk
-                # Remove common prefixes like "Okay, I will...", "Here is the summary:", etc.
-                prefixes_to_clean = [
-                    "Okay,", "Okay.", "Sure,", "Sure.", "Certainly,", "Certainly.",
-                    "Here is", "Here's", "Based on", "To summarize", "In summary",
-                    "好的，", "好的。", "明白，", "没问题，", "以下是", "根据", "总结如下"
-                ]
-                
-                # Simple check: if starts with prefix, try to find the actual start
-                for p in prefixes_to_clean:
-                    if cleaned_summary.lower().startswith(p.lower()):
-                        # Try to split by punctuation (colon, comma, newline)
-                        parts = re.split(r'[:：\n]', cleaned_summary, 1)
-                        if len(parts) > 1:
-                            cleaned_summary = parts[1].strip()
-                        else:
-                            # Just remove the prefix
-                            cleaned_summary = cleaned_summary[len(p):].strip()
-                summaries.append(cleaned_summary)
-            
-        return summaries
