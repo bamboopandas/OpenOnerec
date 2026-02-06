@@ -5,7 +5,7 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_compressed_cot_v3.1}"
+VERSION="${VERSION:-v1.0_compressed_cot_v3}"
 ENABLE_THINKING=${3:-true}
 CUSTOM_DATA_DIR=$4
 
