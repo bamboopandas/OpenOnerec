@@ -1,5 +1,6 @@
 from transformers import AutoTokenizer
 import re
+import os
 
 model_path = os.path.abspath("../checkpoints/OneRec-1.7B")
 try:
