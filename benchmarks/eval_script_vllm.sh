@@ -1,11 +1,8 @@
-#!/bin/bash
-# Compressed CoT Evaluation Script
-# Usage: bash eval_script_compressed.sh <model_path> <result_name> <enable_thinking> <custom_data_dir>
-# Example: bash benchmarks/eval_script_compressed.sh ../checkpoints/OneRec-1.7B results_compressed_1.7B true ../raw_data/onerec_data/benchmark_data_1000
+# Example: bash eval_script_vllm.sh ../checkpoints/OneRec-1.7B results_compressed_1.7B false ../raw_data/onerec_data/benchmark_data_1000
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_true_more_metric}"
+VERSION="${VERSION:-v1.0_vllm_temp_false1}"
 # VERSION="${VERSION:-v1.0_compressed_cot_v3}"
 ENABLE_THINKING=${3:-true}
 CUSTOM_DATA_DIR=$4
@@ -54,20 +51,12 @@ echo "Running all tasks with Compressed CoT Generator"
 PYTHON_EXEC="/home/lkzhang/miniconda3/envs/openonerec/bin/python3"
 SUMMARIZER_MODEL="/zhdd/home/lkzhang/vscode/evaluate_exp/OpenOneRec/data/code/onerec_pretrain/hf_models/Qwen3-1.7B-norec"
 
-# Arguments for the compressed generator
-# generator_type is ignored by evaluate_compressed.py but we keep it for consistency
-# sample_size 1 is inherited from ads script example, can be changed
-# We use num_beams 4 for the final stage (Stage 3), and num_return_sequences 4
-# ARGS="--generator_type compressed_cot --sample_size 1000"
-# ARGS="--generator_type compressed_cot --sample_size 1000"
 ARGS="--generator_type vllm --sample_size 1000"
-# ARGS="--generator_type vllm --summarizer_model_path $SUMMARIZER_MODEL --sample_size 1000"
-# ARGS="--generator_type compressed_cot --summarizer_model_path $SUMMARIZER_MODEL --sample_size 1000"
 
 # Task: ad
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-    --num_gpus 5 \
-    --gpu_ids 1 2 3 4 5 \
+    --num_gpus 1 \
+    --gpu_ids 0 \
     --task_types ad \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -83,8 +72,8 @@ echo "Ad task completed successfully"
 
 # Task: product
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-    --num_gpus 5 \
-    --gpu_ids 1 2 3 4 5 \
+    --num_gpus 1 \
+    --gpu_ids 0 \
     --task_types product \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -100,8 +89,8 @@ echo "Product task completed successfully"
 
 # Task: video
 $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-    --num_gpus 5 \
-    --gpu_ids 1 2 3 4 5 \
+    --num_gpus 1 \
+    --gpu_ids 0 \
     --task_types video \
     --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
@@ -117,8 +106,8 @@ echo "Video task completed successfully"
 
 # # Task: rec_reason
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-#     --num_gpus 5 \
-#     --gpu_ids 1 2 3 4 5 \
+#     --num_gpus 1 \
+#     --gpu_ids 0 \
 #     --task_types rec_reason \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -134,8 +123,8 @@ echo "Video task completed successfully"
 
 # # Task: item_understand
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-#     --num_gpus 5 \
-#     --gpu_ids 1 2 3 4 5 \
+#     --num_gpus 1 \
+#     --gpu_ids 0 \
 #     --task_types item_understand \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -151,8 +140,8 @@ echo "Video task completed successfully"
 
 # # Task: label_cond
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-#     --num_gpus 5 \
-#     --gpu_ids 1 2 3 4 5 \
+#     --num_gpus 1 \
+#     --gpu_ids 0 \
 #     --task_types label_cond \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -168,8 +157,8 @@ echo "Video task completed successfully"
 
 # # Task: interactive
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-#     --num_gpus 5 \
-#     --gpu_ids 1 2 3 4 5 \
+#     --num_gpus 1 \
+#     --gpu_ids 0 \
 #     --task_types interactive \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \
@@ -185,8 +174,8 @@ echo "Video task completed successfully"
 
 # # Task: label_pred
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate_compressed.py \
-#     --num_gpus 5 \
-#     --gpu_ids 1 2 3 4 5 \
+#     --num_gpus 1 \
+#     --gpu_ids 0 \
 #     --task_types label_pred \
 #     --gpu_memory_utilization 0.8 \
 #     --model_path "$MODEL_PATH" \

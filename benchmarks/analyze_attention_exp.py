@@ -9,14 +9,14 @@ import argparse
 import gc
 from typing import List, Dict, Any, Tuple
 import re
-import matplotlib.colors as mcolors
-import matplotlib.ticker as ticker
+from tqdm import tqdm
+import pandas as pd
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from benchmark.benchmark import DataLoaderWrapper
-from benchmark.tasks.v1_0.registry import get_loader
+from benchmark.tasks.v1_0.registry import get_evaluator, get_task_config
 from vllm import LLM, SamplingParams
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -26,26 +26,11 @@ def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def generate_vllm(model_path, prompt, enable_thinking=True):
-    """
-    Generate using vLLM.
-    We initialize vLLM inside this function (or a context manager) 
-    because we might need to clear it to load the HF model later.
-    However, for efficiency, if we run both On/Off, we can keep it alive 
-    if we generate both before switching to HF.
-    """
-    # Note: Initializing LLM is heavy. Ideally we do it once.
-    pass
-
 def analyze_attention(model, tokenizer, full_text, prompt_text, device):
     """
     Run forward pass and extract attention.
     Context = Prompt + Thinking + Prefix
     Query = Semantic ID Sequence (Answer)
-    
-    Split Strategy: Find the LAST <|sid_begin|> tag. 
-    Everything before it is Context. 
-    The SID sequence itself is the Query.
     """
     inputs = tokenizer(full_text, return_tensors="pt").to(device)
     input_ids = inputs.input_ids
@@ -63,7 +48,6 @@ def analyze_attention(model, tokenizer, full_text, prompt_text, device):
     
     if sid_begin_indices:
         # Use the LAST occurrence to identify the generated answer
-        # (Previous occurrences might be in the prompt history)
         split_idx = sid_begin_indices[-1]
         
         # Find corresponding end tag
@@ -71,30 +55,23 @@ def analyze_attention(model, tokenizer, full_text, prompt_text, device):
             end_idx = ids_list.index(sid_end_id, split_idx) + 1 # Include end tag
         except ValueError:
             end_idx = len(ids_list)
-            
-        print(f"DEBUG: Found last <|sid_begin|> at token {split_idx}. Treating previous as Context.")
     else:
-        # Fallback if no SID found (e.g. error or text-only answer)
-        # Try finding </think>
+        # Fallback if no SID found
         think_end_id = tokenizer.convert_tokens_to_ids("</think>")
         if think_end_id in ids_list:
              locs = [i for i, x in enumerate(ids_list) if x == think_end_id]
              split_idx = locs[-1] + 1
-             print(f"DEBUG: No SID found. Splitting at </think> (token {split_idx}).")
         else:
              # Fallback to Prompt Length
              prompt_enc = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=True)
              split_idx = prompt_enc.input_ids.shape[1]
-             print(f"DEBUG: No SID/Think found. Splitting at Prompt Length ({split_idx}).")
 
     context_indices = list(range(0, split_idx))
     query_indices = list(range(split_idx, end_idx))
     
     if not query_indices:
-        print("Error: No query tokens found.")
-        # Return valid empty result to avoid crash
-        zeros = np.zeros(len(context_indices))
-        return [], {'mean': zeros, 'first': zeros}
+        # Return valid empty result
+        return [], {'mean': np.zeros(len(context_indices)), 'first': np.zeros(len(context_indices))}
 
     with torch.no_grad():
         outputs = model(input_ids, output_attentions=True)
@@ -108,7 +85,6 @@ def analyze_attention(model, tokenizer, full_text, prompt_text, device):
     # Cols: Keys (Context)
     attn_block = avg_attn[query_indices, :][:, context_indices] # (Query_Len, Context_Len)
     
-    # Calculate Attentions
     attentions = {}
     
     if attn_block.shape[0] > 0:
@@ -116,30 +92,20 @@ def analyze_attention(model, tokenizer, full_text, prompt_text, device):
         attentions['mean'] = attn_block.mean(dim=0).to(torch.float32).cpu().numpy()
         
         # First: First Semantic ID (Index 1)
-        # If query has <|sid_begin|> and IDs, index 0 is tag, index 1 is first ID.
         if attn_block.shape[0] >= 2:
             attentions['first'] = attn_block[1, :].to(torch.float32).cpu().numpy()
         else:
-            # Fallback to index 0 (tag) if no IDs follow
             attentions['first'] = attn_block[0, :].to(torch.float32).cpu().numpy()
     else:
         zeros = np.zeros(len(context_indices))
         attentions['mean'] = zeros
         attentions['first'] = zeros
     
-    # Get tokens for visualization
     tokens = []
     for idx in context_indices:
         tid = ids_list[idx]
         t_str = tokenizer.decode([tid], skip_special_tokens=False)
         tokens.append(t_str)
-    
-    # Debug
-    print(f"DEBUG: Context Size: {len(tokens)}, Query Size: {len(query_indices)}")
-    if any("<think>" in t for t in tokens):
-        print("DEBUG: <think> tag found in tokens context.")
-    else:
-        print("DEBUG: <think> tag NOT found in tokens context.")
     
     return tokens, attentions
 
@@ -150,10 +116,8 @@ def calculate_metrics(tokens, attention_values):
     O: Semantic ID tokens (<s_...>)
     T: Other tokens (Text, tags, etc.)
     """
-    import re
-    
     # Regex for Semantic ID
-    # Pattern: <s_a_123>, <s_b_456>, etc.
+    # Ensure raw string and correct backslash for digits
     sid_pattern = re.compile(r"^<s_[abc]_\d+>$")
     
     sum_attn_O = 0.0
@@ -162,7 +126,6 @@ def calculate_metrics(tokens, attention_values):
     count_T = 0
     
     for token, attn_val in zip(tokens, attention_values):
-        # Check if token is SID
         if sid_pattern.match(token):
             sum_attn_O += attn_val
             count_O += 1
@@ -170,7 +133,6 @@ def calculate_metrics(tokens, attention_values):
             sum_attn_T += attn_val
             count_T += 1
             
-    # Normalize A_T + A_O = 1
     total_raw = sum_attn_T + sum_attn_O
     if total_raw == 0:
         return {"MDI": 0, "AEI": 0, "A_T": 0, "A_O": 0, "count_T": count_T, "count_O": count_O}
@@ -178,17 +140,15 @@ def calculate_metrics(tokens, attention_values):
     A_T = sum_attn_T / total_raw
     A_O = sum_attn_O / total_raw
     
-    # 1) MDI calculation
-    # MDI = (A_T / |T|) / (A_O / |O|)
+    # MDI
     if count_T > 0 and count_O > 0 and A_O > 0:
         avg_attn_T = A_T / count_T
         avg_attn_O = A_O / count_O
         MDI = avg_attn_T / avg_attn_O
     else:
-        MDI = 0.0 # Undefined or edge case
+        MDI = 0.0
         
-    # 2) AEI calculation
-    # AEI = P_T / Q_T = A_T / (|T| / (|T| + |O|))
+    # AEI
     if (count_T + count_O) > 0 and count_T > 0:
         Q_T = count_T / (count_T + count_O)
         AEI = A_T / Q_T
@@ -197,12 +157,29 @@ def calculate_metrics(tokens, attention_values):
         
     return {
         "MDI": float(MDI), 
-        "AEI": float(AEI), 
-        "A_T": float(A_T), 
-        "A_O": float(A_O), 
+        "AEI": float(AEI),
         "count_T": int(count_T), 
         "count_O": int(count_O)
     }
+
+def evaluate_samples(task_name, samples, data_dir, output_dir):
+    """
+    Use Benchmark Evaluator to score samples.
+    """
+    evaluator_class = get_evaluator(task_name)
+    task_config = get_task_config(task_name)
+    
+    evaluator = evaluator_class(
+        samples=samples,
+        task_name=task_name,
+        predictions_dir=output_dir, # Dummy
+        debug=False,
+        task_config=task_config,
+        data_dir=data_dir
+    )
+    
+    metrics, per_sample_metrics = evaluator.evaluate()
+    return per_sample_metrics
 
 def main():
     parser = argparse.ArgumentParser()
@@ -214,58 +191,21 @@ def main():
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Set visible devices
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
     
-    # Load Custom Font
-    import matplotlib.font_manager as fm
-    font_path = os.path.join(os.path.dirname(__file__), "SimHei.ttf")
-    if os.path.exists(font_path):
-        font_prop = fm.FontProperties(fname=font_path)
-        print(f"Loaded font from {font_path}")
-    else:
-        font_prop = fm.FontProperties(family=['sans-serif', 'WenQuanYi Micro Hei', 'SimHei'])
-        print("Warning: SimHei.ttf not found, using system fallback.")
-    
-    # 1. Select Sample
-    print(f"Loading data for task: {args.task_name}")
+    # 1. Load Data
+    print(f"Loading data for task: {args.task_name} (Think=True)...")
     loader_on = DataLoaderWrapper(args.model_path, "v1.0", args.data_dir, enable_thinking=True)
-    data_on = loader_on.load_data(args.task_name, split="test", sample_size=100)
+    data_on = loader_on.load_data(args.task_name, split="test", sample_size=None)
     
+    print(f"Loading data for task: {args.task_name} (Think=False)...")
     loader_off = DataLoaderWrapper(args.model_path, "v1.0", args.data_dir, enable_thinking=False)
-    data_off = loader_off.load_data(args.task_name, split="test", sample_size=100)
+    data_off = loader_off.load_data(args.task_name, split="test", sample_size=None)
     
-    common_ids = list(set(data_on.keys()) & set(data_off.keys()))
-    if not common_ids:
-        raise ValueError("No common samples found!")
+    # Intersect IDs
+    sample_ids = list(set(data_on.keys()) & set(data_off.keys()))
+    print(f"Total Common Samples: {len(sample_ids)}")
     
-    sample_id = "41"
-    if sample_id not in common_ids:
-        print(f"Warning: Requested sample_id {sample_id} not in data. Falling back to random.")
-        sample_id = random.choice(common_ids)
-    print(f"Selected Sample ID: {sample_id}")
-    
-    sample_on = data_on[sample_id]
-    sample_off = data_off[sample_id]
-    
-    prompt_on = sample_on["prompt"]
-    prompt_off = sample_off["prompt"]
-    
-    # Force Think Mode if not present
-    if "<think>" not in prompt_on and "<|im_start|>think" not in prompt_on:
-        print("DEBUG: <think> not in prompt. Appending manually.")
-        if prompt_on.endswith("\n"):
-            prompt_on += "<think>\n"
-        else:
-            prompt_on += "\n<think>\n"
-            
-    print(f"DEBUG: Prompt On Tail: {prompt_on[-50:]!r}")
-    
-    # Save Sample Metadata
-    with open(os.path.join(args.output_dir, "sample_metadata.json"), "w") as f:
-        json.dump({"sample_id": sample_id, "seed": 42}, f)
-        
     # 2. Generation (vLLM)
     print("Starting vLLM Generation...")
     llm = LLM(
@@ -276,34 +216,76 @@ def main():
         dtype="bfloat16"
     )
     
-    # Add stop token to ensure we only generate one item (as per user request)
     sampling_params = SamplingParams(
         n=1,
         temperature=0.7, 
         top_p=0.9, 
         max_tokens=2048,
-        stop=["<|sid_end|", "<|im_end|>"] 
+        stop=["<|sid_end|", "<|im_end|>"],
+        seed=42
     )
     
-    # Run Think=On
-    print(f"Generating On...")
-    output_on = llm.generate([prompt_on], sampling_params)[0]
-    text_on_generated = output_on.outputs[0].text
-    full_text_on = prompt_on + text_on_generated
+    # Prepare Prompts
+    prompts_on = []
+    prompts_off = []
     
-    # Run Think=Off
-    print(f"Generating Off...")
-    output_off = llm.generate([prompt_off], sampling_params)[0]
-    text_off_generated = output_off.outputs[0].text
-    full_text_off = prompt_off + text_off_generated
+    for sid in sample_ids:
+        prompts_on.append(data_on[sid]["prompt"])
+        prompts_off.append(data_off[sid]["prompt"])
+        
+    print(f"Generating {len(prompts_on)} samples (Think=On)...")
+    outputs_on = llm.generate(prompts_on, sampling_params)
     
+    print(f"Generating {len(prompts_off)} samples (Think=Off)...")
+    outputs_off = llm.generate(prompts_off, sampling_params)
+    
+    # Store Generation Results
+    gen_data_on = {}
+    gen_data_off = {}
+    
+    for i, sid in enumerate(sample_ids):
+        # On
+        text_on = outputs_on[i].outputs[0].text
+        gen_data_on[sid] = {
+            "generations": [text_on],
+            "ground_truth": data_on[sid]["ground_truth"],
+            "metadata": data_on[sid].get("metadata", {}),
+            "full_text": prompts_on[i] + text_on,
+            "prompt": prompts_on[i]
+        }
+        
+        # Off
+        text_off = outputs_off[i].outputs[0].text
+        gen_data_off[sid] = {
+            "generations": [text_off],
+            "ground_truth": data_off[sid]["ground_truth"],
+            "metadata": data_off[sid].get("metadata", {}),
+            "full_text": prompts_off[i] + text_off,
+            "prompt": prompts_off[i]
+        }
+
     # Cleanup vLLM
     print("Cleaning up vLLM...")
     del llm
     gc.collect()
     torch.cuda.empty_cache()
     
-    # 3. Analysis (HF)
+    # 3. Evaluation
+    print("Evaluating Performance...")
+    metrics_on = evaluate_samples(args.task_name, gen_data_on, args.data_dir, args.output_dir)
+    metrics_off = evaluate_samples(args.task_name, gen_data_off, args.data_dir, args.output_dir)
+    
+    # Extract Score
+    sample_key_on = list(metrics_on.keys())[0]
+    metric_keys = list(metrics_on[sample_key_on].keys())
+    pass_key = next((k for k in metric_keys if k.startswith("pass@")), None)
+    if not pass_key:
+        print("Warning: No pass@k metric found. Using 'pass' if exists.")
+        pass_key = "pass" # fallback
+    else:
+        print(f"Using metric: {pass_key} for performance.")
+
+    # 4. Attention Analysis (HF)
     print("Starting HF Analysis...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
@@ -314,248 +296,98 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     
-    # Analyze On
-    print("Analyzing On...")
-    tokens_on, attns_on = analyze_attention(model, tokenizer, full_text_on, prompt_on, model.device)
+    results_on = []
+    results_off = []
     
-    # Analyze Off
-    print("Analyzing Off...")
-    tokens_off, attns_off = analyze_attention(model, tokenizer, full_text_off, prompt_off, model.device)
-    
-    # 4. Visualization
-    # Robust Normalization (98th Percentile)
-    def get_robust_limit(arr):
-        if len(arr) == 0: return 1.0
-        # Exclude BOS (index 0) from stats if possible
-        data = arr
-        if len(arr) > 1:
-            data = arr[1:]
-        return np.percentile(data, 98) # 98th percentile
-    
-    # Calculate limits based on 'first' since it's primary
-    vmax_first = max(get_robust_limit(attns_on['first']), get_robust_limit(attns_off['first']))
-    vmax_mean = max(get_robust_limit(attns_on['mean']), get_robust_limit(attns_off['mean']))
-    vmin = 0
-    
-    print(f"Visualization VMax (First): {vmax_first}")
-    print(f"Visualization VMax (Mean): {vmax_mean}")
-    
-    def plot_text_heatmap(tokens, attn, title, filename, v_max):
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
-        from matplotlib.backends.backend_pdf import PdfPages
-        import math
+    print("Analyzing Attention...")
+    for sid in tqdm(sample_ids):
+        # --- Think=On ---
+        full_text_on = gen_data_on[sid]["full_text"]
+        prompt_on = gen_data_on[sid]["prompt"]
+        tokens_on, attns_on = analyze_attention(model, tokenizer, full_text_on, prompt_on, model.device)
+        m_on = calculate_metrics(tokens_on, attns_on['mean'])
         
-        # A4 Dimensions (inches)
-        A4_WIDTH = 8.27
-        A4_HEIGHT = 11.69
+        # Calculate CoT Length
+        try:
+            think_start = tokens_on.index("<think>")
+            think_end = tokens_on.index("</think>")
+            cot_len = think_end - think_start - 1
+            if cot_len < 0: cot_len = 0
+        except ValueError:
+            cot_len = 0
+            
+        perf_on = 1.0 if metrics_on[sid].get(pass_key, False) else 0.0
         
-        # Layout Settings
-        MARGIN_X = 0.5
-        MARGIN_TOP = 0.9
-        MARGIN_BOTTOM = 1.0 # For legend
-        
-        USABLE_WIDTH = A4_WIDTH - 2 * MARGIN_X
-        USABLE_HEIGHT = A4_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM
-        
-        # Abstract Layout Units (0-100 width)
-        MAX_X = 100
-        LINE_HEIGHT = 6.0
-        FONT_SIZE = 10
-        
-        # Mapping Units to Inches
-        # 100 units = USABLE_WIDTH inches
-        unit_to_inch = USABLE_WIDTH / MAX_X
-        line_height_inch = LINE_HEIGHT * unit_to_inch
-        
-        lines_per_page = int(USABLE_HEIGHT / line_height_inch)
-        
-        # Colormap setup
-        cmap = plt.get_cmap('YlOrRd')
-        norm = mcolors.PowerNorm(gamma=0.5, vmin=vmin, vmax=v_max)
-        
-        # Robust Width Calculation
-        def get_visual_length(s):
-            l = 0
-            for c in s:
-                if ord(c) > 127: l += 1.8 # CJK character width factor
-                else: l += 1.0 # ASCII
-            return l
+        results_on.append({
+            "Sample_ID": sid,
+            "MDI": m_on["MDI"],
+            "AEI": m_on["AEI"],
+            "CoT_Len": cot_len,
+            "Performance": perf_on,
+            "Count_T": m_on["count_T"],
+            "Count_O": m_on["count_O"]
+        })
 
-        # --- Pre-calculate Layout ---
-        layout_items = []
-        current_x = 0
-        current_y = 0 # Starts at 0, goes down
+        # --- Think=Off ---
+        full_text_off = gen_data_off[sid]["full_text"]
+        prompt_off = gen_data_off[sid]["prompt"]
+        tokens_off, attns_off = analyze_attention(model, tokenizer, full_text_off, prompt_off, model.device)
+        m_off = calculate_metrics(tokens_off, attns_off['mean'])
         
-        for i, token in enumerate(tokens):
-            display_token = token.replace('\n', '\\n').replace('\t', '→')
-            if display_token.startswith("<|"):
-                display_token = display_token
-            
-            # Estimate width based on visual length
-            # Base padding + char width * visual length
-            # Tuned for font size 10 on this canvas width
-            # Multiplier 1.2 ensures enough space for both ASCII and CJK
-            w = 1.0 + 1.2 * get_visual_length(display_token)
-            
-            # Wrap
-            if current_x + w > MAX_X:
-                current_x = 0
-                current_y -= LINE_HEIGHT
-            
-            val = attn[i]
-            color_val = min(max(val, vmin), v_max)
-            bg_color = cmap(norm(color_val))
-            
-            r, g, b, _ = bg_color
-            luminance = 0.299*r + 0.587*g + 0.114*b
-            text_color = 'black' if luminance > 0.5 else 'white'
-            
-            layout_items.append({
-                'text': display_token,
-                'x': current_x,
-                'y': current_y,
-                'w': w,
-                'h': LINE_HEIGHT,
-                'bg': bg_color,
-                'fg': text_color
-            })
-            
-            current_x += w
-            
-        # --- Split into Pages ---
-        # Group by line index
-        pages = []
-        if layout_items:
-            # Determine total lines
-            min_y = layout_items[-1]['y']
-            # y goes 0, -6, -12...
-            # line_index = abs(y) / 6
-            
-            current_page_items = []
-            current_page_idx = 0
-            
-            for item in layout_items:
-                line_idx = abs(item['y']) / LINE_HEIGHT
-                page_idx = int(line_idx // lines_per_page)
-                
-                if page_idx > current_page_idx:
-                    pages.append(current_page_items)
-                    current_page_items = []
-                    current_page_idx = page_idx
-                
-                # Adjust Y to be relative to page top (0)
-                # Global Y is e.g. -150. Page start Y is e.g. -120 (if 20 lines/page * 6)
-                # Local Y = -150 - (-120) = -30
-                page_start_y = -(page_idx * lines_per_page * LINE_HEIGHT)
-                local_y = item['y'] - page_start_y
-                
-                # Clone item with new Y
-                local_item = item.copy()
-                local_item['y'] = local_y
-                current_page_items.append(local_item)
-            
-            if current_page_items:
-                pages.append(current_page_items)
-        
-        # --- Render PDF ---
-        with PdfPages(filename) as pdf:
-            for p_idx, items in enumerate(pages):
-                fig = plt.figure(figsize=(A4_WIDTH, A4_HEIGHT))
-                # Adjust figure layout to use more space
-                # rect is [left, bottom, right, top] in normalized 0-1 coords
-                # USABLE_HEIGHT is what we pre-calculated.
-                # Let's adjust the subplot explicitly.
-                ax = fig.add_axes([MARGIN_X/A4_WIDTH, MARGIN_BOTTOM/A4_HEIGHT, 
-                                   USABLE_WIDTH/A4_WIDTH, USABLE_HEIGHT/A4_HEIGHT])
-                
-                # Set coordinate system
-                ax.set_xlim(0, MAX_X)
-                # Y goes from approx 0 to -Height
-                y_span_units = lines_per_page * LINE_HEIGHT
-                
-                # Shifted ylim to start exactly at top (0)
-                ax.set_ylim(-y_span_units, 0.5) 
-                
-                ax.axis('off')
-                
-                # Draw Items
-                for item in items:
-                    rect = Rectangle((item['x'], item['y'] - item['h']*0.85), item['w'], item['h'], 
-                                     facecolor=item['bg'], edgecolor='none')
-                    ax.add_patch(rect)
-                    
-                    ax.text(item['x'] + item['w']/2, item['y'] - item['h']*0.35, item['text'], 
-                            color=item['fg'], fontsize=FONT_SIZE, ha='center', va='center',
-                            fontproperties=font_prop)
-                
-                # Title - Removed as per request
-                # plt.title(f"{title}\nPage {p_idx+1}/{len(pages)}", fontproperties=font_prop, y=0.98, fontsize=12)
-                
-                # Colorbar (Legend)
-                # Position: [left, bottom, width, height] relative to figure
-                cbar_ax = fig.add_axes([0.1, 0.05, 0.8, 0.02])
-                sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-                sm.set_array([])
-                cbar = plt.colorbar(sm, cax=cbar_ax, orientation='horizontal')
-                cbar.locator = ticker.MaxNLocator(nbins=5)
-                cbar.update_ticks()
-                cbar.set_label('Attention Value', fontproperties=font_prop)
-                
-                pdf.savefig(fig)
-                plt.close()
+        # CoT Length for Off should be 0 (or negligible if empty tags exist)
+        try:
+             # Check if tags exist even if empty
+             if "<think>" in tokens_off and "</think>" in tokens_off:
+                 ts = tokens_off.index("<think>")
+                 te = tokens_off.index("</think>")
+                 cot_len_off = te - ts - 1
+                 if cot_len_off < 0: cot_len_off = 0
+             else:
+                 cot_len_off = 0
+        except ValueError:
+             cot_len_off = 0
 
-    # Calculate Metrics (using 'mean' attention)
-    metrics_on = calculate_metrics(tokens_on, attns_on['mean'])
-    print(f"\nMetrics (Think=On):")
-    print(f"  MDI: {metrics_on['MDI']:.4f}")
-    print(f"  AEI: {metrics_on['AEI']:.4f}")
-    print(f"  Attention: Text={metrics_on['A_T']:.2%}, IDs={metrics_on['A_O']:.2%}")
-    print(f"  Counts: Text={metrics_on['count_T']}, IDs={metrics_on['count_O']}")
-    
-    metrics_off = calculate_metrics(tokens_off, attns_off['mean'])
-    print(f"\nMetrics (Think=Off):")
-    print(f"  MDI: {metrics_off['MDI']:.4f}")
-    print(f"  AEI: {metrics_off['AEI']:.4f}")
-    print(f"  Attention: Text={metrics_off['A_T']:.2%}, IDs={metrics_off['A_O']:.2%}")
-    print(f"  Counts: Text={metrics_off['count_T']}, IDs={metrics_off['count_O']}")
+        perf_off = 1.0 if metrics_off[sid].get(pass_key, False) else 0.0
+        
+        results_off.append({
+            "Sample_ID": sid,
+            "MDI": m_off["MDI"],
+            "AEI": m_off["AEI"],
+            "CoT_Len": cot_len_off,
+            "Performance": perf_off,
+            "Count_T": m_off["count_T"],
+            "Count_O": m_off["count_O"]
+        })
 
-    # Save Results
-    # Convert numpy arrays to lists for JSON serialization
-    res_on = {
-        "tokens": tokens_on, 
-        "attention_values_first": attns_on['first'].tolist(),
-        "attention_values_mean": attns_on['mean'].tolist(),
-        "full_text": full_text_on,
-        "metrics": metrics_on
-    }
-    with open(os.path.join(args.output_dir, "results_think_on.json"), "w") as f:
-        json.dump(res_on, f, indent=2, ensure_ascii=False)
-        
-    res_off = {
-        "tokens": tokens_off, 
-        "attention_values_first": attns_off['first'].tolist(),
-        "attention_values_mean": attns_off['mean'].tolist(),
-        "full_text": full_text_off,
-        "metrics": metrics_off
-    }
-    with open(os.path.join(args.output_dir, "results_think_off.json"), "w") as f:
-        json.dump(res_off, f, indent=2, ensure_ascii=False)
-        
-    # Plot First ID Attention (Requested)
-    plot_text_heatmap(tokens_on, attns_on['first'], f"Attention Map (Think=On, First ID)\nSample {sample_id}", os.path.join(args.output_dir, "heatmap_on_first.pdf"), vmax_first)
-    plot_text_heatmap(tokens_off, attns_off['first'], f"Attention Map (Think=Off, First ID)\nSample {sample_id}", os.path.join(args.output_dir, "heatmap_off_first.pdf"), vmax_first)
+    # 5. Save Results
+    df_on = pd.DataFrame(results_on)
+    df_off = pd.DataFrame(results_off)
     
-    # Plot Mean Attention (Optional/Reference)
-    plot_text_heatmap(tokens_on, attns_on['mean'], f"Attention Map (Think=On, Mean)\nSample {sample_id}", os.path.join(args.output_dir, "heatmap_on_mean.pdf"), vmax_mean)
-    plot_text_heatmap(tokens_off, attns_off['mean'], f"Attention Map (Think=Off, Mean)\nSample {sample_id}", os.path.join(args.output_dir, "heatmap_off_mean.pdf"), vmax_mean)
+    file_on = os.path.join(args.output_dir, "results_all_on.csv")
+    file_off = os.path.join(args.output_dir, "results_all_off.csv")
     
-    # Copy 'first' to standard names for ease of access
-    import shutil
-    shutil.copy(os.path.join(args.output_dir, "heatmap_on_first.pdf"), os.path.join(args.output_dir, "heatmap_on.pdf"))
-    shutil.copy(os.path.join(args.output_dir, "heatmap_off_first.pdf"), os.path.join(args.output_dir, "heatmap_off.pdf"))
+    df_on.to_csv(file_on, index=False)
+    df_off.to_csv(file_off, index=False)
     
-    print("Done.")
+    print(f"\nSaved Think=On results to {file_on}")
+    print(f"Saved Think=Off results to {file_off}")
+    
+    # 6. Basic Statistics Printout
+    print("\n=== Summary Statistics (On) ===")
+    print(df_on.describe())
+    
+    print("\n=== Summary Statistics (Off) ===")
+    print(df_off.describe())
+    
+    # 7. Correlation (Delta) for quick check
+    # Merge on Sample_ID
+    df_merged = pd.merge(df_on, df_off, on="Sample_ID", suffixes=(_on, _off))
+    df_merged["Delta_Perf"] = df_merged["Performance_on"] - df_merged["Performance_off"]
+    df_merged["Delta_MDI"] = df_merged["MDI_on"] - df_merged["MDI_off"]
+    df_merged["Delta_AEI"] = df_merged["AEI_on"] - df_merged["AEI_off"]
+    
+    print("\n=== Correlations (Delta) ===")
+    print(df_merged[["Delta_Perf", "Delta_MDI", "Delta_AEI"]].corr())
 
 if __name__ == "__main__":
     setup_seed(42)
