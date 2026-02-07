@@ -1,4 +1,5 @@
 #!/bin/bash
+unset LD_PRELOAD
 # bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000 0
 # bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000 
 
@@ -9,6 +10,7 @@ VERSION="${VERSION:-v1.0_1000_thinkfalse_temp}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 GPU_ID="${5:-0}"
+export CUDA_VISIBLE_DEVICES=$GPU_ID
 
 # Read configuration from environment variables (set by eval_script.py)
 # Fallback to hardcoded paths if not set

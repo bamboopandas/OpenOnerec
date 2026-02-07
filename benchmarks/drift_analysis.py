@@ -84,8 +84,17 @@ def main():
     setup_seed(args.seed)
     
     # Resolve model path if relative
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isabs(args.model_path):
-        args.model_path = os.path.abspath(args.model_path)
+        # Try relative to current working directory first, then relative to script
+        if os.path.exists(os.path.join(os.getcwd(), args.model_path)):
+            args.model_path = os.path.abspath(os.path.join(os.getcwd(), args.model_path))
+        else:
+            args.model_path = os.path.abspath(os.path.join(script_dir, args.model_path))
+
+    if not os.path.exists(args.model_path):
+        console.print(f"[red]Error: Model path does not exist: {args.model_path}[/red]")
+        sys.exit(1)
 
     console.print(f"Loading model from {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
