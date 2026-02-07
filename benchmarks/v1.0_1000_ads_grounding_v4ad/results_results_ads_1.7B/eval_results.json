@@ -1,0 +1,27 @@
+{
+  "OneRec-1.7B": {
+    "ad": {
+      "test": {
+        "total_samples": 1000,
+        "pass@1": 0.017,
+        "position1_pass@1": 0.003,
+        "recall@1": 0.003156746031746032,
+        "pass@32": 0.158,
+        "position1_pass@32": 0.059,
+        "recall@32": 0.048961904761904804,
+        "pid_pass@1": 0.014,
+        "pid_position1_pass@1": 0.002,
+        "pid_recall@1": 0.002615079365079365,
+        "pid_pass@32": 0.15,
+        "pid_position1_pass@32": 0.052,
+        "pid_recall@32": 0.045080158730158755,
+        "select_k_strategy": "first_k",
+        "evaluation_mode": "both",
+        "sid_to_pid_strategy": "most_popular_after_downsampling",
+        "total_time": 14798.823626756668,
+        "avg_time_per_sample": 14.798823626756668
+      }
+    },
+    "_total_time": 14798.823626756668
+  }
+}
