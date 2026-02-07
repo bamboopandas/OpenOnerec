@@ -537,6 +537,7 @@ class RayVllmGenerator(RayMixin, VllmMixin, Generator):
             "dtype": dtype,
             "tensor_parallel_size": tensor_parallel_size,
             "max_logprobs": max_logprobs,
+            "enforce_eager": True,
         }
 
         if max_model_len is not None:
