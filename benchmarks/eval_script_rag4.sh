@@ -89,7 +89,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --worker_batch_size 1875 \
     --overwrite \
     --num_beams 4 --num_return_sequences 4 --num_return_thinking_sequences 1 \
-    --sample_size 5 \
+    --cd_alpha 0.5 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Ad task completed successfully"
 cleanup_gpu $GPU_ID

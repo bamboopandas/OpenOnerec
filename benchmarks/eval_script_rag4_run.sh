@@ -4,7 +4,7 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_1000_thinktrue_temp_v4_0.01}"
+VERSION="${VERSION:-v1.0_1000_thinktrue_temp_v5_0.5}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 GPU_ID="${5:-1}"
@@ -88,7 +88,7 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --dtype bfloat16 --max_model_len 8192 \
     --worker_batch_size 1875 \
     --overwrite \
-    --num_beams 8 --num_return_sequences 64 --num_return_thinking_sequences 1 \
+    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Ad task completed successfully"
 cleanup_gpu $GPU_ID

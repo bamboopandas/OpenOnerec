@@ -8,10 +8,10 @@ from typing import List, Dict, Set, Tuple
 # Configuration
 K_VALUES = [1, 3, 5, 10, 16, 32]
 TASKS = ["ad", "product", "video"]
-# Modified BASE_DIR for OneRec-8B
-BASE_DIR = "benchmarks/results/v1.0_1000_thinktrue_tryspeed/results_results_8B/OneRec-8B/OneRec-8B" ##
-# Output file in the same directory as eval_results.json for OneRec-8B
-OUTPUT_FILE = "benchmarks/results/v1.0_1000_thinktrue_tryspeed/results_results_8B/OneRec-8B/eval_results_all.json"
+# Modified BASE_DIR for OneRec-1.7B
+BASE_DIR = "benchmarks/results/v1.0_1000_thinktrue_temp_v4_0.5/results_results_1.7B/OneRec-1.7B/OneRec-1.7B" ##
+# Output file in the same directory as eval_results.json for OneRec-1.7B
+OUTPUT_FILE = "benchmarks/results/v1.0_1000_thinktrue_temp_v4_0.5/results_results_1.7B/OneRec-1.7B/eval_results_all.json"
 DATA_DIR = "raw_data/onerec_data/benchmark_data"
 
 # Constants for SID encoding
@@ -134,7 +134,7 @@ def main():
     sid2pid = load_pid_mapping(os.path.join(DATA_DIR, "sid2pid.json"))
     sid2iid = load_pid_mapping(os.path.join(DATA_DIR, "sid2iid.json"))
     
-    all_results = {"OneRec-8B": {}}
+    all_results = {"OneRec-1.7B": {}}
     
     for task in TASKS:
         file_path = os.path.join(BASE_DIR, task, "test_generated.json")
@@ -210,14 +210,14 @@ def main():
 
         if valid_samples > 0:
             avg_metrics = {k: v / valid_samples for k, v in sum_metrics.items()}
-            all_results["OneRec-8B"][task] = {
+            all_results["OneRec-1.7B"][task] = {
                 "test": {
                     "total_samples": valid_samples,
                     **avg_metrics
                 }
             }
         else:
-             all_results["OneRec-8B"][task] = {"test": {"total_samples": 0}}
+             all_results["OneRec-1.7B"][task] = {"test": {"total_samples": 0}}
 
     try:
         with open(OUTPUT_FILE, 'w') as f:

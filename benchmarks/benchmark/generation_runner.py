@@ -194,24 +194,55 @@ class GenerationRunner:
                 # 2.5 Score with Baseline Model (Original Prompt without CoT)
                 # Baseline Prompt: Original Prompt + prompt_token
                 baseline_prompts = {}
-                for sid, _ in amateur_prompts.items():
+                expert_prompts = {} # Re-score expert to ensure consistency (Use "logits" equivalent)
+                
+                for sid, candidates in valid_sample_ids:
                     # extract original sid from synth_id "sid___idx"
-                    original_sid = sid.split("___")[0]
-                    baseline_prompts[sid] = prompts[original_sid] + prompt_token
+                    # valid_sample_ids is list of (sid, candidates)
+                    # candidates is list of dicts with "synth_id", "original_text"
+                    
+                    for cand in candidates:
+                        synth_id = cand["synth_id"]
+                        
+                        # Baseline: Original Prompt + prompt_token
+                        baseline_prompts[synth_id] = prompts[sid] + prompt_token
+                        
+                        # Expert: Original Prompt + CoT + prompt_token
+                        # We need to reconstruct the Expert Prompt.
+                        # cand["original_text"] is the FULL text (CoT + prompt_token + Completion)?
+                        # No, generate() returns the text *generated*.
+                        # For Two-Stage with Thinking, the output from generate() (which is stage 2 result)
+                        # contains: <think>...</think>\n<|sid_begin|>SID_SEQUENCE
+                        # So, Expert Prompt should be: Original Prompt + CoT + prompt_token
+                        
+                        # Extract CoT from the generated text
+                        text = cand["original_text"]
+                        parts = text.split(prompt_token)
+                        if len(parts) >= 2:
+                            cot = parts[0] # Includes <think>...</think>\n
+                            # Expert Prompt = Original Prompt + CoT + prompt_token
+                            expert_prompts[synth_id] = prompts[sid] + cot + prompt_token
 
                 baseline_scores, _ = generator.score(baseline_prompts, completions_map)
+                expert_scores_recomputed, _ = generator.score(expert_prompts, completions_map)
                 
                 # 3. Adjust Scores and Rerank
                 # Scaling parameter alpha for Contrastive Decoding
-                alpha = kwargs.get("cd_alpha", 0.01) 
-                console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking")
+                alpha = kwargs.get("cd_alpha", 0.5) 
+                console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking (with consistent re-scoring)")
 
                 for sid, candidates in valid_sample_ids:
                     reranked_candidates = []
                     
                     for cand in candidates:
                         synth_id = cand["synth_id"]
-                        expert_score = cand["expert_score"]
+                        
+                        # Get expert score (recomputed)
+                        if synth_id in expert_scores_recomputed and expert_scores_recomputed[synth_id]:
+                            expert_val = expert_scores_recomputed[synth_id][0]
+                        else:
+                            # Fallback to generation score if re-scoring fails (unlikely)
+                            expert_val = cand["expert_score"]
                         
                         # Get amateur score (list of 1)
                         if synth_id in amateur_scores and amateur_scores[synth_id]:
@@ -229,7 +260,7 @@ class GenerationRunner:
                         amateur_score_combined = amateur_val - baseline_val
 
                         # Contrastive Score: (1+alpha) * Expert - alpha * (Amateur - Baseline)
-                        final_score = (1 + alpha) * expert_score - alpha * amateur_score_combined
+                        final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
                         
                         reranked_candidates.append({
                             "text": cand["original_text"],
