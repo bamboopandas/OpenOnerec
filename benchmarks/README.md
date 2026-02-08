@@ -110,4 +110,35 @@ Log files are located at:
 | rec_reason | Kuaishou Internal | 470 | Recommendation reason inference |
 
 
+---
 
+## Inference-Time Alignment (Training-Free)
+
+We provide a standalone script for inference-time re-alignment using ASP-SCP (Attribution Selection & Structured Context), TPD (Text-Prior Direction), PDC/CDC (Drift Correction), and Uncertainty Gating (UG).
+
+### Usage
+
+```bash
+python benchmarks/run_inference_alignment.py \
+    --data_path <path_to_parquet_data> \
+    --model_path checkpoints/OneRec-1.7B \
+    --output_path alignment_results.jsonl \
+    --num_samples 100 \
+    --top_k 5 \
+    --alpha 0.5 \
+    --beta0 0.0 \
+    --beta1 1.0
+```
+
+### Outputs
+
+The script produces a JSONL file where each line corresponds to a test instance and contains:
+- `no_think_topk`: Baseline recommendations (No-Think).
+- `think_topk`: Recommendations with Chain-of-Thought (CoT).
+- `pdc_topk`: Recommendations corrected via Projected Drift Correction.
+- `cdc_topk`: Recommendations corrected via Contrastive Drift Correction.
+- `ours_topk`: Final recommendations using Uncertainty Gating (UG).
+- `metrics`: Diagnostic metrics (drift magnitude, alignment, entropy gap, etc.).
+- `gt_items`: Ground truth items.
+
+```

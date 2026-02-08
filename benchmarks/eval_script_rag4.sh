@@ -1,23 +1,25 @@
 #!/bin/bash
-unset LD_PRELOAD
-# bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000 0
-# bash eval_script_rag4.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000 
+# bash eval_script_true.sh ../checkpoints/OneRec-1.7B results_1.7B true ../raw_data/onerec_data/benchmark_data_1000 0
+# bash eval_script_true.sh ../checkpoints/OneRec-1.7B-pro results_1.7B true ../raw_data/onerec_data/benchmark_data_1000 0
+# bash eval_script_false.sh ../checkpoints/OneRec-8B-pro results_8B true ../raw_data/onerec_data/benchmark_data_1000 0
+
 
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_1000_thinkfalse_temp}"
+VERSION="${VERSION:-v1.0_1000_thinktrue_temp}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 GPU_ID="${5:-0}"
-export CUDA_VISIBLE_DEVICES=$GPU_ID
 
 # Read configuration from environment variables (set by eval_script.py)
 # Fallback to hardcoded paths if not set
 BENCHMARK_BASE_DIR="${BENCHMARK_BASE_DIR:-.}"
 DATA_VERSION="${DATA_VERSION:-v1.0}"
 
+# BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}"
 BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}/$(basename "${MODEL_PATH}")"
+
 BASE_LOG_NAME="${BENCHMARK_BASE_DIR}/auto_eval_logs/${VERSION}/$2"
 
 if [ -n "$CUSTOM_DATA_DIR" ]; then
