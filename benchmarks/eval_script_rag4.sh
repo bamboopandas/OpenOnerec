@@ -83,7 +83,8 @@ $PYTHON_EXEC -u scripts/evaluate_contrastive.py \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "${BASE_OUTPUT_DIR}" \
-    --dtype bfloat16 \
+    --dtype bfloat16 --max_model_len 8192 \
+    --worker_batch_size 1875 \
     --overwrite \
     --alpha 0.5 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1

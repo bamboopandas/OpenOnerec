@@ -10,56 +10,21 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 benchmark_dir = os.path.dirname(current_dir) # benchmarks/ 
 sys.path.append(benchmark_dir)
 
+# Add ray-vllm to sys.path to allow importing from utils.arguments
+ray_vllm_dir = os.path.join(current_dir, "ray-vllm")
+sys.path.append(ray_vllm_dir)
+
 from benchmark import Benchmark
 from benchmark.console import *
 from benchmark.contrastive_generator import ContrastiveGenerator
-
-@dataclass
-class ModelConfig:
-    """Model loading and initialization parameters"""
-    model_path: str = field(
-        metadata={"help": "Model path or HuggingFace model name (e.g., Qwen/Qwen2-7B)", "required": True}
-    )
-    dtype: str = field(
-        default='bfloat16',
-        metadata={"help": "Model data type: auto, half, float16, bfloat16, float, float32"}
-    )
-    
-@dataclass
-class BenchmarkConfig:
-    """Benchmark execution and evaluation parameters"""
-    task_types: Optional[List[str]] = field(
-        default=None,
-        metadata={"help": "Task name list (e.g., item_understand rec_reason)"}
-    )
-    sample_size: Optional[str] = field(
-        default=None,
-        metadata={"help": "Sample size for evaluation (e.g., 'full' for all data, or a number like '100')"}
-    )
-    splits: List[str] = field(
-        default_factory=lambda: ['test'],
-        metadata={"help": "Dataset split list"}
-    )
-    data_dir: str = field(
-        default='./data',
-        metadata={"help": "Data directory path"}
-    )
-    output_dir: str = field(
-        default='./results',
-        metadata={"help": "Output directory for results"}
-    )
-    overwrite: bool = field(
-        default=False,
-        metadata={"help": "Whether to overwrite existing results"}
-    )
-
-@dataclass
-class PromptConfig:
-    """Prompt formatting and template parameters"""
-    enable_thinking: bool = field(
-        default=False,
-        metadata={"help": "Enable thinking mode for apply_chat_template (overrides task config if set)"}
-    )
+from utils.arguments import (
+    ModelConfig,
+    InfrastructureConfig,
+    InferenceConfig,
+    GenerationConfig,
+    PromptConfig,
+    BenchmarkConfig
+)
 
 @dataclass
 class ContrastiveConfig:
@@ -80,12 +45,19 @@ class ContrastiveConfig:
 def main():
     parser = HfArgumentParser([
         ModelConfig,
-        BenchmarkConfig,
+        InfrastructureConfig,
+        InferenceConfig,
+        GenerationConfig,
         PromptConfig,
+        BenchmarkConfig,
         ContrastiveConfig
     ])
-    model_config, benchmark_config, prompt_config, cd_config = \
-        parser.parse_args_into_dataclasses()
+    
+    # We use parse_args_into_dataclasses to handle all args
+    # Note: We import config classes from ray_vllm.utils.arguments to match the shell script args exactly.
+    
+    (model_config, infra_config, inference_config, generation_config, 
+     prompt_config, benchmark_config, cd_config) = parser.parse_args_into_dataclasses()
 
     # 1. Initialize Benchmark
     benchmark = Benchmark(
@@ -97,12 +69,17 @@ def main():
     )
     
     # 2. Initialize ContrastiveGenerator
+    # We pass relevant args from the configs to the generator
     generator = ContrastiveGenerator(
         model_name_or_path=model_config.model_path,
         dtype=model_config.dtype,
         alpha=cd_config.alpha,
         beta=cd_config.beta,
-        max_new_tokens=cd_config.max_new_tokens
+        max_new_tokens=cd_config.max_new_tokens,
+        max_model_len=model_config.max_model_len,
+        trust_remote_code=model_config.trust_remote_code,
+        # We pass ignored args just in case generator wants to log them or strict check
+        gpu_memory_utilization=infra_config.gpu_memory_utilization,
     )
 
     # 3. Generate text
@@ -113,7 +90,11 @@ def main():
         # Generation parameters
         enable_thinking=prompt_config.enable_thinking,
         sample_size=benchmark_config.sample_size,
-        max_new_tokens=cd_config.max_new_tokens
+        max_new_tokens=cd_config.max_new_tokens,
+        temperature=generation_config.temperature,
+        top_p=generation_config.top_p,
+        top_k=generation_config.top_k,
+        num_return_sequences=generation_config.num_return_sequences,
     )
     
     # 4. Cleanup (optional for local script)

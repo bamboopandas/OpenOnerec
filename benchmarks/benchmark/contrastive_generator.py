@@ -27,6 +27,8 @@ class ContrastiveGenerator(HfTransformersMixin, Generator):
         beta: float = 0.1,  # Adaptive plausibility threshold (optional, strict mode)
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         dtype: str = "bfloat16",
+        trust_remote_code: bool = True,
+        max_model_len: Optional[int] = None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -36,14 +38,35 @@ class ContrastiveGenerator(HfTransformersMixin, Generator):
         self.device = device
         
         console.print(f"Loading model from {model_name_or_path}...", style=subhead_style_2)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
         
-        torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+        # Tokenizer initialization
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path, 
+            trust_remote_code=trust_remote_code
+        )
+        if max_model_len:
+            self.tokenizer.model_max_length = max_model_len
+        
+        # Determine dtype
+        torch_dtype = torch.bfloat16 if dtype == "bfloat16" else (torch.float16 if dtype == "float16" else "auto")
+        
+        # Enable Flash Attention 2 if available and compatible
+        attn_implementation = "eager"
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+            if dtype in ["bfloat16", "float16"]:
+                try:
+                    import flash_attn
+                    attn_implementation = "flash_attention_2"
+                    console.print("Enable Flash Attention 2", style=success_style)
+                except ImportError:
+                    console.print("Flash Attention 2 not installed, using eager", style=warning_style)
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             torch_dtype=torch_dtype,
             device_map=device,
-            trust_remote_code=True
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_implementation
         )
         self.model.eval()
         
