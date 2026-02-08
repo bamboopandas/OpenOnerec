@@ -2,6 +2,7 @@
 # bash eval_script_false.sh ../checkpoints/OneRec-1.7B results_1.7B false ../raw_data/onerec_data/benchmark_data_1000 0
 # bash eval_script_false.sh ../checkpoints/OneRec-1.7B-pro results_1.7B false ../raw_data/onerec_data/benchmark_data_1000 0
 # bash eval_script_false.sh ../checkpoints/OneRec-8B-pro results_8B false ../raw_data/onerec_data/benchmark_data_1000 0
+# bash eval_script_false.sh ../checkpoints/OneRec-8B results_8B false ../raw_data/onerec_data/benchmark_data_1000 1
 
 # Set common variables
 MODEL_PATH=$1

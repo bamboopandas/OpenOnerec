@@ -4,8 +4,8 @@ import re
 import pandas as pd
 
 # File paths
-INPUT_FILE = "benchmarks/results/v1.0_1000_thinkfalse_tryspeed/results_results_8B/OneRec-8B/eval_results_all.json"
-# INPUT_FILE = "benchmarks/results/v1.0_1000_thinkfalse_tryspeed/results_results_8B/OneRec-8B-pro/eval_results_all.json"
+INPUT_FILE = "benchmarks/results/v1.0_1000_thinktrue_tryspeed/results_results_8B/OneRec-8B/eval_results_all.json"
+# INPUT_FILE = "benchmarks/results/v1.0_1000_thinktrue_tryspeed/results_results_8B/OneRec-8B-pro/eval_results_all.json"
 OUTPUT_FILE = "eval_results_pid.xlsx"
 # OUTPUT_FILE = "eval_results_pid_pro.xlsx"
 
