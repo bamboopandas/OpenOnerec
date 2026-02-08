@@ -4,10 +4,10 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_1000_thinktrue_temp}"
+VERSION="${VERSION:-v1.0_1000_thinktrue_temp64}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
-GPU_ID="${5:-0}"
+GPU_ID="${5:-1}"
 
 # Read configuration from environment variables (set by eval_script.py)
 # Fallback to hardcoded paths if not set
@@ -84,7 +84,7 @@ $PYTHON_EXEC -u scripts/evaluate_contrastive.py \
     --data_dir "$DATA_DIR" \
     --output_dir "${BASE_OUTPUT_DIR}" \
     --dtype bfloat16 --max_model_len 8192 \
-    --worker_batch_size 1875 \
+    --worker_batch_size 64 \
     --overwrite \
     --alpha 0.5 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1

@@ -101,7 +101,7 @@ class Generator(ABC):
                 results, _, mfu_stats = self.extract_token_logprobs(prompts, target_tokens, **kwargs_classification)
 
                 self.mfu_stats = mfu_stats
-                return results, {}
+                return results, {}, mfu_stats
         elif max_new_thinking_tokens:
             if enable_thinking:
                 # A & B with thinking: two-stage generation
@@ -109,7 +109,9 @@ class Generator(ABC):
                     f"Two-stage generation enabled: thinking (max_new_thinking_tokens={max_new_thinking_tokens}) + prompt_token ({prompt_token})",
                     style=warning_style,
                 )
-                return self._generate_two_stage_with_thinking(prompts, **kwargs)
+                results, logprobs, mfu_stats = self._generate_two_stage_with_thinking(prompts, **kwargs)
+                self.mfu_stats = mfu_stats
+                return results, logprobs, mfu_stats
             else:
                 # A & B without thinking
                 if prompt_token:
@@ -347,7 +349,7 @@ class Generator(ABC):
             if thinking_sample_id in stage2_logprobs:
                 final_logprobs[original_sample_id].extend(stage2_logprobs[thinking_sample_id])
 
-        return (dict(final_results), dict(final_logprobs))
+        return (dict(final_results), dict(final_logprobs), self.mfu_stats)
 
     def _generate_two_stage_classification_with_thinking(
         self,
@@ -477,7 +479,7 @@ class Generator(ABC):
             combined = f"{thinking_text}</think>\n{json_str}"
             final_results[original_sample_id].append(combined)
 
-        return (dict(final_results), {})
+        return (dict(final_results), {}, self.mfu_stats)
 
 
 class HfTransformersMixin:

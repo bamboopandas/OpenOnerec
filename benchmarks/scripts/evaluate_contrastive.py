@@ -95,6 +95,7 @@ def main():
         top_p=generation_config.top_p,
         top_k=generation_config.top_k,
         num_return_sequences=generation_config.num_return_sequences,
+        worker_batch_size=inference_config.worker_batch_size,
     )
     
     # 4. Cleanup (optional for local script)

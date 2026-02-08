@@ -100,9 +100,68 @@ class GenerationRunner:
         references = {id: data["ground_truth"] for id, data in test_data.items()}
 
         # 3. Generate text (unified entry point)
-        # All tasks now go through the unified generate() method
-        # For classification tasks, target_tokens is already in kwargs from generation_config
-        generations, logprobs = generator.generate(prompts, **kwargs)
+        if hasattr(generator, 'generate_contrastive') and kwargs.get('enable_thinking', False):
+            console.print("[Contrastive] Starting Phase 1: Thinking Generation", style=subhead_style_2)
+            # Phase 1: Thinking
+            # We use standard generate() for this, assuming it handles batching
+            think_generations, think_logprobs, think_mfu = generator.generate(prompts, **kwargs)
+            
+            expert_prompts = {}
+            amateur_prompts = {}
+            cot_parts = {}
+            
+            console.print("[Contrastive] Processing CoT and preparing Phase 2", style=subhead_style_2)
+            for sample_id, gens in think_generations.items():
+                gen_text = gens[0] # Take first candidate
+                
+                # Robust CoT extraction
+                cot_content = ""
+                if "<think>" in gen_text and "</think>" in gen_text:
+                    cot_content = gen_text.split("<think>")[1].split("</think>")[0]
+                elif "<think>" in gen_text:
+                    cot_content = gen_text.split("<think>")[1]
+                elif "</think>" in gen_text:
+                    cot_content = gen_text.split("</think>")[0]
+                else:
+                    cot_content = gen_text
+                
+                # Expert: Prompt + <think> + CoT + </think>
+                # Note: prompts[sample_id] ends with .../think<|im_end|>\n<|im_start|>assistant\n
+                # We append the extracted/generated thinking.
+                expert_prompts[sample_id] = prompts[sample_id] + "<think>" + cot_content + "</think>"
+                
+                # Amateur: Assistant + <think> + CoT + </think> + \n\n
+                amateur_prompts[sample_id] = f"<|im_start|>assistant\n<think>{cot_content}</think>\n\n"
+                
+                # Store CoT part for reconstruction: <think>...
+                cot_parts[sample_id] = "<think>" + cot_content + "</think>"
+
+            console.print("[Contrastive] Starting Phase 2: Contrastive Decoding", style=subhead_style_2)
+            # Phase 2: Contrastive
+            # Pass expert and amateur prompts
+            contrast_gens, _, contrast_mfu = generator.generate_contrastive(
+                expert_prompts, 
+                amateur_prompts, 
+                **kwargs
+            )
+            
+            # Combine results
+            generations = {}
+            for sample_id, ans_list in contrast_gens.items():
+                # Reconstruct: CoT + Answer
+                full_gen = cot_parts[sample_id] + ans_list[0]
+                generations[sample_id] = [full_gen]
+                
+            # Merge MFU stats if possible (simplified: just take Phase 2 or sum?)
+            # For simplicity, we just use Phase 2 stats or the generator's internal tracking if refined
+            logprobs = {} # Contrastive doesn't easily return logprobs of the difference
+            
+            # Update MFU stats to include Phase 1
+            # (Optional: complex merge logic omitted for brevity, keeping Phase 2 stats which are critical for throughput)
+            
+        else:
+            # Standard generation
+            generations, logprobs = generator.generate(prompts, **kwargs)
         
         end_time = time.time()
 
