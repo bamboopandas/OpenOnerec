@@ -191,9 +191,19 @@ class GenerationRunner:
                 # Pass batch of (CoT, Completion) pairs
                 amateur_scores, _ = generator.score(amateur_prompts, completions_map)
                 
+                # 2.5 Score with Baseline Model (Original Prompt without CoT)
+                # Baseline Prompt: Original Prompt + prompt_token
+                baseline_prompts = {}
+                for sid, _ in amateur_prompts.items():
+                    # extract original sid from synth_id "sid___idx"
+                    original_sid = sid.split("___")[0]
+                    baseline_prompts[sid] = prompts[original_sid] + prompt_token
+
+                baseline_scores, _ = generator.score(baseline_prompts, completions_map)
+                
                 # 3. Adjust Scores and Rerank
                 # Scaling parameter alpha for Contrastive Decoding
-                alpha = kwargs.get("cd_alpha", 0.1) 
+                alpha = kwargs.get("cd_alpha", 0.01) 
                 console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking")
 
                 for sid, candidates in valid_sample_ids:
@@ -205,12 +215,21 @@ class GenerationRunner:
                         
                         # Get amateur score (list of 1)
                         if synth_id in amateur_scores and amateur_scores[synth_id]:
-                            amateur_score = amateur_scores[synth_id][0]
+                            amateur_val = amateur_scores[synth_id][0]
                         else:
-                            amateur_score = 0.0
+                            amateur_val = 0.0
+                        
+                        # Get baseline score (list of 1)
+                        if synth_id in baseline_scores and baseline_scores[synth_id]:
+                            baseline_val = baseline_scores[synth_id][0]
+                        else:
+                            baseline_val = 0.0
                             
-                        # Contrastive Score: (1+alpha) * Expert - alpha * Amateur
-                        final_score = (1 + alpha) * expert_score - alpha * amateur_score
+                        # Amateur Score Adjusted: Amateur - Baseline
+                        amateur_score_combined = amateur_val - baseline_val
+
+                        # Contrastive Score: (1+alpha) * Expert - alpha * (Amateur - Baseline)
+                        final_score = (1 + alpha) * expert_score - alpha * amateur_score_combined
                         
                         reranked_candidates.append({
                             "text": cand["original_text"],
