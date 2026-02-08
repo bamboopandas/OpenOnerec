@@ -77,21 +77,18 @@ echo "Running all tasks"
 PYTHON_EXEC="/home/lkzhang/miniconda3/envs/openonerec/bin/python3"
 
 # Task: ad
-$PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
-    --num_gpus 1 \
-    --gpu_ids $GPU_ID \
+export CUDA_VISIBLE_DEVICES=$GPU_ID
+$PYTHON_EXEC -u scripts/evaluate_contrastive.py \
     --task_types ad \
-    --gpu_memory_utilization 0.8 \
     --model_path "$MODEL_PATH" \
     --data_dir "$DATA_DIR" \
     --output_dir "${BASE_OUTPUT_DIR}" \
-    --dtype bfloat16 --max_model_len 8192 \
-    --worker_batch_size 1875 \
+    --dtype bfloat16 \
     --overwrite \
-    --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
+    --alpha 0.5 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Ad task completed successfully"
-cleanup_gpu $GPU_ID
+# cleanup_gpu $GPU_ID
 # # Task: product
 # $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
 #     --num_gpus 1 \
