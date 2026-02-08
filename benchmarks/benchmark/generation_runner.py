@@ -183,38 +183,74 @@ class GenerationRunner:
                 # Pass batch of (CoT, Completion) pairs
                 amateur_scores, _ = generator.score(amateur_prompts, completions_map)
                 
+                # 2.5 Score with Baseline Model (Original Prompt without CoT)
+                # Baseline Prompt: Original Prompt + prompt_token
+                baseline_prompts = {}
+                expert_prompts = {} # Re-score expert to ensure consistency (Use "logits" equivalent)
+                
+                for sid, candidates in valid_sample_ids:
+                    # extract original sid from synth_id "sid___idx"
+                    # valid_sample_ids is list of (sid, candidates)
+                    # candidates is list of dicts with "synth_id", "original_text"
+                    
+                    for cand in candidates:
+                        synth_id = cand["synth_id"]
+                        
+                        # Baseline: Original Prompt + prompt_token
+                        baseline_prompts[synth_id] = prompts[sid] + prompt_token
+                        
+                        # Expert: Original Prompt + CoT + prompt_token
+                        # Extract CoT from the generated text
+                        text = cand["original_text"]
+                        parts = text.split(prompt_token)
+                        if len(parts) >= 2:
+                            cot = parts[0] # Includes <think>...</think>\n
+                            # Expert Prompt = Original Prompt + CoT + prompt_token
+                            expert_prompts[synth_id] = prompts[sid] + cot + prompt_token
+
+                baseline_scores, _ = generator.score(baseline_prompts, completions_map)
+                expert_scores_recomputed, _ = generator.score(expert_prompts, completions_map)
+                
                 # 3. Adjust Scores and Rerank
                 # Scaling parameter alpha for Contrastive Decoding
-                alpha = kwargs.get("cd_alpha", 0.0) 
-                console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking")
+                alpha = kwargs.get("cd_alpha", 0.5) 
+                console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking (with consistent re-scoring)")
 
                 for sid, candidates in valid_sample_ids:
                     reranked_candidates = []
                     
                     for cand in candidates:
                         synth_id = cand["synth_id"]
-                        expert_score = cand["expert_score"]
+                        
+                        # Get expert score (recomputed)
+                        if synth_id in expert_scores_recomputed and expert_scores_recomputed[synth_id]:
+                            expert_val = expert_scores_recomputed[synth_id][0]
+                        else:
+                            # Fallback to generation score if re-scoring fails (unlikely)
+                            expert_val = cand["expert_score"]
                         
                         # Get amateur score (list of 1)
                         if synth_id in amateur_scores and amateur_scores[synth_id]:
-                            amateur_score = amateur_scores[synth_id][0]
+                            amateur_val = amateur_scores[synth_id][0]
                         else:
-                            amateur_score = 0.0
+                            amateur_val = 0.0
+                        
+                        # Get baseline score (list of 1)
+                        if synth_id in baseline_scores and baseline_scores[synth_id]:
+                            baseline_val = baseline_scores[synth_id][0]
+                        else:
+                            baseline_val = 0.0
                             
-                        # Contrastive Score: (1+alpha) * Expert - alpha * Amateur
-                        final_score = (1 + alpha) * expert_score - alpha * amateur_score
+                        # Amateur Score Adjusted: Amateur - Baseline
+                        amateur_score_combined = amateur_val - baseline_val
+
+                        # Contrastive Score: (1+alpha) * Expert - alpha * (Amateur - Baseline)
+                        final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
                         
                         reranked_candidates.append({
                             "text": cand["original_text"],
                             "score": final_score
                         })
-                    
-                    # Sort by new score descending
-                    reranked_candidates.sort(key=lambda x: x["score"], reverse=True)
-                    
-                    # Update generations and logprobs
-                    generations[sid] = [x["text"] for x in reranked_candidates]
-                    logprobs[sid] = [x["score"] for x in reranked_candidates]
                     
             console.print(f"[Contrastive Decoding] Reranking complete for {len(valid_sample_ids)} samples.", style=success_style)
 

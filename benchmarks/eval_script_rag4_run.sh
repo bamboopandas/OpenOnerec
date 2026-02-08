@@ -4,7 +4,7 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_1000_thinktrue_ours_v1_0.0}"
+VERSION="${VERSION:-v1.0_1000_thinktrue_ours_v2_0.5}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 GPU_ID="${5:-1}"
