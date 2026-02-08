@@ -245,7 +245,10 @@ class GenerationRunner:
                         amateur_score_combined = amateur_val - baseline_val
 
                         # Contrastive Score: (1+alpha) * Expert - alpha * (Amateur - Baseline)
-                        final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
+                        # v3
+                        final_score = (1 + alpha) * expert_val - alpha * amateur_val
+                        # v2
+                        # final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
                         
                         reranked_candidates.append({
                             "text": cand["original_text"],
