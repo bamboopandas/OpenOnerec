@@ -185,7 +185,7 @@ class GenerationRunner:
                 
                 # 3. Adjust Scores and Rerank
                 # Scaling parameter alpha for Contrastive Decoding
-                alpha = kwargs.get("cd_alpha", -0.1) 
+                alpha = kwargs.get("cd_alpha", 0.0) 
                 console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking")
 
                 for sid, candidates in valid_sample_ids:

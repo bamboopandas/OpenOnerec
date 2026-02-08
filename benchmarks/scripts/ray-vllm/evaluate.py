@@ -3,7 +3,7 @@ import torch
 
 from benchmark import Benchmark
 from benchmark.console import *
-from utils.generator import RayVllmGenerator
+from utils.generator import RayVllmGenerator, CompressedCoTGenerator
 from utils.arguments import (
     ModelConfig,
     InfrastructureConfig,
@@ -39,7 +39,15 @@ def main():
     generator = None
     try:
         # 2. Initialize Ray + vLLM generator (Multi-Node Support)
-        generator = RayVllmGenerator(
+        GeneratorClass = CompressedCoTGenerator if prompt_config.enable_thinking else RayVllmGenerator
+        
+        if prompt_config.enable_thinking:
+            console.print(
+                "[Config] Using CompressedCoTGenerator (Thinking Enabled, Compressed CoT Mode)", 
+                style=warning_style
+            )
+
+        generator = GeneratorClass(
             model_name_or_path=model_config.model_path,
             checkpoint_path=model_config.checkpoint_path,
             trust_remote_code=model_config.trust_remote_code,
