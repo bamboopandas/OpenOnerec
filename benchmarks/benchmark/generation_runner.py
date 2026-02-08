@@ -12,6 +12,7 @@ Note: Does NOT compute evaluation metrics (handled by task-specific evaluators)
 import json
 import os
 import time
+import re
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 
@@ -104,6 +105,119 @@ class GenerationRunner:
         # For classification tasks, target_tokens is already in kwargs from generation_config
         generations, logprobs = generator.generate(prompts, **kwargs)
         
+        # --- Contrastive Decoding / Reranking Logic ---
+        prompt_token = kwargs.get("prompt_token")
+        enable_thinking = kwargs.get("enable_thinking", False)
+        
+        if enable_thinking and prompt_token and hasattr(generator, "score"):
+            console.print(f"\n[Contrastive Decoding] Applying contrastive reranking...", style=subhead_style)
+            
+            amateur_prompts = {}
+            completions_map = {}
+            valid_sample_ids = []
+            
+            # 1. Prepare inputs for Amateur Model
+            for sid, gens in generations.items():
+                if not gens:
+                    continue
+                
+                # Assume all candidates share the same CoT structure?
+                # Actually CoT is generated, so it might differ per candidate.
+                # If CoT differs, the "Amateur Context" differs per candidate.
+                # My `score` implementation supports one prompt per sample.
+                # If CoT differs per candidate, I need to treat each (sid, candidate_idx) as a unique sample for scoring.
+                # But `score` takes `prompts` and `completions`.
+                # If I have unique prompts per candidate, I can't use `score(prompts, completions)` directly 
+                # because `prompts` keys are sample_ids.
+                
+                # However, usually CoT is generated ONCE if we use `num_return_thinking_sequences=1`.
+                # But `RECOMMENDATION_GENERATION_CONFIG` has `num_return_sequences=128`.
+                # And `num_return_thinking_sequences=8`.
+                # Wait, usually the thinking part is shared?
+                # No, if we use beam search or sampling, different paths have different thinking.
+                
+                # The user says: "Generate item recommendations using the complete input (history, etc. + CoT) to build an 'expert model'".
+                # This implies CoT is part of the generation.
+                
+                # If CoT varies per candidate, the Amateur Prompt varies per candidate.
+                # I need to score (AmateurPrompt_i, Completion_i).
+                
+                # My `score` method assumes `prompts[sid]` is unique.
+                # I should modify the logic to handle unique prompts per candidate?
+                # OR, I can construct synthetic IDs: `sid_0`, `sid_1`...
+                
+                current_gens = gens
+                current_logprobs = logprobs.get(sid, [])
+                
+                # Store processed candidates to reconstruct
+                processed_candidates = []
+                
+                for idx, text in enumerate(current_gens):
+                    # Parse CoT and Completion
+                    # Format: CoT <|sid_begin|> Completion
+                    parts = text.split(prompt_token)
+                    if len(parts) >= 2:
+                        cot = parts[0]
+                        # Join the rest in case prompt_token appears again (unlikely but safe)
+                        completion = prompt_token.join(parts[1:]) 
+                        
+                        # Amateur Prompt: CoT + prompt_token
+                        amateur_prompt = cot + prompt_token
+                        
+                        # Use synthetic ID
+                        synth_id = f"{sid}___{idx}"
+                        amateur_prompts[synth_id] = amateur_prompt
+                        completions_map[synth_id] = [completion]
+                        
+                        processed_candidates.append({
+                            "original_text": text,
+                            "expert_score": current_logprobs[idx] if idx < len(current_logprobs) else 0.0,
+                            "synth_id": synth_id
+                        })
+                
+                if processed_candidates:
+                    valid_sample_ids.append((sid, processed_candidates))
+            
+            if amateur_prompts:
+                # 2. Score with Amateur Model
+                # Pass batch of (CoT, Completion) pairs
+                amateur_scores, _ = generator.score(amateur_prompts, completions_map)
+                
+                # 3. Adjust Scores and Rerank
+                # Scaling parameter alpha for Contrastive Decoding
+                alpha = kwargs.get("cd_alpha", -0.1) 
+                console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking")
+
+                for sid, candidates in valid_sample_ids:
+                    reranked_candidates = []
+                    
+                    for cand in candidates:
+                        synth_id = cand["synth_id"]
+                        expert_score = cand["expert_score"]
+                        
+                        # Get amateur score (list of 1)
+                        if synth_id in amateur_scores and amateur_scores[synth_id]:
+                            amateur_score = amateur_scores[synth_id][0]
+                        else:
+                            amateur_score = 0.0
+                            
+                        # Contrastive Score: (1+alpha) * Expert - alpha * Amateur
+                        final_score = (1 + alpha) * expert_score - alpha * amateur_score
+                        
+                        reranked_candidates.append({
+                            "text": cand["original_text"],
+                            "score": final_score
+                        })
+                    
+                    # Sort by new score descending
+                    reranked_candidates.sort(key=lambda x: x["score"], reverse=True)
+                    
+                    # Update generations and logprobs
+                    generations[sid] = [x["text"] for x in reranked_candidates]
+                    logprobs[sid] = [x["score"] for x in reranked_candidates]
+                    
+            console.print(f"[Contrastive Decoding] Reranking complete for {len(valid_sample_ids)} samples.", style=success_style)
+
         end_time = time.time()
 
         total_time = end_time - start_time

@@ -388,6 +388,101 @@ class VllmWorker:
 
         return (all_results, all_mfu_stats)
 
+    def score_batch(
+        self,
+        prompts: Dict[str, str],
+        completions: Dict[str, List[str]],
+        worker_batch_size: int = 8
+    ) -> tuple:
+        """
+        Score completions (calculate logprobs) given prompts
+
+        Args:
+            prompts: {sample_id: prompt_text}
+            completions: {sample_id: [completion_1, completion_2, ...]}
+            worker_batch_size: Worker internal batch size
+
+        Returns:
+            Tuple of two dicts:
+            - First dict: {sample_id: [score_1, score_2, ...]}
+            - Second dict: {sample_id: {"input_tokens": [int], "output_tokens": [int], "times": [float]}}
+        """
+        import time
+        stage_start_time = time.time()
+
+        if not prompts:
+            return ({}, {})
+
+        # Build sampling parameters for scoring
+        # We use max_tokens=1 and prompt_logprobs=1 to get logprobs of the prompt
+        # We will not actually generate new tokens (or just 1 ignored token)
+        params_dict = {
+            "max_tokens": 1,
+            "prompt_logprobs": 1,
+        }
+        sp = SamplingParams(**params_dict)
+
+        sample_ids = list(prompts.keys())
+        all_scores = {}
+        all_mfu_stats = {}
+
+        # Flatten requests for batching: (sample_id, completion_idx, full_text, prompt_len)
+        flat_requests = []
+        for sid in sample_ids:
+            if sid not in completions:
+                continue
+            prompt = prompts[sid]
+            # Tokenize prompt to know where completion starts
+            prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
+            prompt_len = len(prompt_tokens)
+            
+            for c_idx, comp in enumerate(completions[sid]):
+                full_text = prompt + comp
+                flat_requests.append((sid, c_idx, full_text, prompt_len))
+
+        num_batches = (len(flat_requests) + worker_batch_size - 1) // worker_batch_size
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * worker_batch_size
+            end_idx = min(start_idx + worker_batch_size, len(flat_requests))
+            
+            batch_reqs = flat_requests[start_idx:end_idx]
+            batch_texts = [r[2] for r in batch_reqs]
+            
+            try:
+                batch_outputs = self.llm.generate(batch_texts, sp)
+                
+                for i, output in enumerate(batch_outputs):
+                    sid, c_idx, _, prompt_len = batch_reqs[i]
+                    
+                    # Calculate score from prompt_logprobs
+                    score = 0.0
+                    if output.prompt_logprobs:
+                        # Sum logprobs of completion tokens
+                        # Check bounds
+                        if len(output.prompt_logprobs) > prompt_len:
+                            for pos in range(prompt_len, len(output.prompt_logprobs)):
+                                logprob_dict = output.prompt_logprobs[pos]
+                                if logprob_dict:
+                                    token_id = output.prompt_token_ids[pos]
+                                    if token_id in logprob_dict:
+                                        score += logprob_dict[token_id].logprob
+                        
+                        if sid not in all_scores:
+                            all_scores[sid] = [0.0] * len(completions[sid])
+                        
+                        if c_idx < len(all_scores[sid]):
+                            all_scores[sid][c_idx] = score
+
+            except Exception as e:
+                import traceback
+                print(f"  [Worker {self.worker_id}] Scoring batch failed: {e}")
+                print(traceback.format_exc())
+
+        stage_elapsed_time = time.time() - stage_start_time
+        
+        return (all_scores, {})
+
 
 class RayVllmGenerator(RayMixin, VllmMixin, Generator):
     """
@@ -861,4 +956,64 @@ class RayVllmGenerator(RayMixin, VllmMixin, Generator):
         )
 
         return (results, {}, mfu_stats)
+
+    def score(
+        self,
+        prompts: Dict[str, str],
+        completions: Dict[str, List[str]],
+        **kwargs
+    ) -> tuple:
+        """
+        Score completions for given prompts (distributed)
+        
+        Args:
+            prompts: {sample_id: prompt_text}
+            completions: {sample_id: [completion_1, ...]}
+            
+        Returns:
+            Tuple of (scores_dict, mfu_stats)
+            scores_dict: {sample_id: [score_1, ...]}
+        """
+        console.print(
+            f"Scoring candidates...",
+            style=subhead_style_2,
+        )
+        
+        if not prompts:
+            return ({}, {})
+            
+        # Round-robin assign tasks to Workers
+        sample_ids = list(prompts.keys())
+        num_workers = len(self.workers)
+        worker_tasks = [dict() for _ in range(num_workers)] # prompts
+        worker_completions = [dict() for _ in range(num_workers)] # completions
+        
+        for i, sample_id in enumerate(sample_ids):
+            if sample_id in completions:
+                worker_idx = i % num_workers
+                worker_tasks[worker_idx][sample_id] = prompts[sample_id]
+                worker_completions[worker_idx][sample_id] = completions[sample_id]
+        
+        # Execute in parallel
+        futures = []
+        for i, worker in enumerate(self.workers):
+            if worker_tasks[i]:
+                future = worker.score_batch.remote(
+                    worker_tasks[i], 
+                    worker_completions[i], 
+                    self.worker_batch_size
+                )
+                futures.append(future)
+                
+        # Collect results
+        worker_results = ray.get(futures)
+        
+        results = {}
+        mfu_stats = {}
+        for res in worker_results:
+            scores, stats = res
+            results.update(scores)
+            mfu_stats.update(stats)
+            
+        return (results, mfu_stats)
     

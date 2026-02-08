@@ -4,10 +4,10 @@
 
 # Set common variables
 MODEL_PATH=$1
-VERSION="${VERSION:-v1.0_1000_thinktrue_temp}"
+VERSION="${VERSION:-v1.0_1000_thinktrue_temp_-0.1}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
-GPU_ID="${5:-0}"
+GPU_ID="${5:-1}"
 
 # Read configuration from environment variables (set by eval_script.py)
 # Fallback to hardcoded paths if not set
