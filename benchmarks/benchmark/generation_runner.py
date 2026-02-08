@@ -161,8 +161,16 @@ class GenerationRunner:
                         # Join the rest in case prompt_token appears again (unlikely but safe)
                         completion = prompt_token.join(parts[1:]) 
                         
-                        # Amateur Prompt: CoT + prompt_token
-                        amateur_prompt = cot + prompt_token
+                        # Amateur Prompt: Masked Prompt + CoT + prompt_token
+                        # Mask history in the original prompt (replace SID blocks with fixed placeholder)
+                        original_prompt = prompts[sid]
+                        masked_prompt = re.sub(r'(?:<\|sid_begin\|>.*?<\|sid_end\|>[\s\n]*)+', ' <|history_masked|> ', original_prompt, flags=re.DOTALL)
+                        amateur_prompt = masked_prompt + cot + prompt_token
+                        
+                        # [DEBUG] Print amateur prompt example (once)
+                        if len(valid_sample_ids) == 0 and idx == 0:
+                            console.print(f"[DEBUG] Amateur Prompt Example:", style=warning_style)
+                            console.print(f"{amateur_prompt}", style=dim_style)
                         
                         # Use synthetic ID
                         synth_id = f"{sid}___{idx}"
@@ -185,7 +193,7 @@ class GenerationRunner:
                 
                 # 3. Adjust Scores and Rerank
                 # Scaling parameter alpha for Contrastive Decoding
-                alpha = kwargs.get("cd_alpha", -0.1) 
+                alpha = kwargs.get("cd_alpha", 0.1) 
                 console.print(f"[Contrastive Decoding] Using alpha={alpha} for reranking")
 
                 for sid, candidates in valid_sample_ids:
