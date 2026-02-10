@@ -9,8 +9,8 @@ export VLLM_ATTENTION_BACKEND=FLASHINFER
 # Set common variables
 MODEL_PATH=$1
 # VERSION="${VERSION:-a}"
-VERSION="${VERSION:-v1.0_1000_try5090_chazhi_b_now}"
-# VERSION="${VERSION:-v1.0_1000_thinktrue_ours_v3_0.5}"
+VERSION="${VERSION:-aaaaaa}"
+# VERSION="${VERSION:-v1.0_1000_5090_chazhi}"
 ENABLE_THINKING=$3
 CUSTOM_DATA_DIR=$4
 
@@ -29,9 +29,9 @@ BENCHMARK_BASE_DIR="${BENCHMARK_BASE_DIR:-.}"
 DATA_VERSION="${DATA_VERSION:-v1.0}"
 
 # BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}"
-BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}/$(basename "${MODEL_PATH}")"
+# BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}/$(basename "${MODEL_PATH}")"
 
-BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}_${HOSTNAME}/$(basename "${MODEL_PATH}")"
+BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/result0210/${VERSION}/results_${2}_${HOSTNAME}/$(basename "${MODEL_PATH}")"
 
 
 BASE_LOG_NAME="${BENCHMARK_BASE_DIR}/auto_eval_logs/${VERSION}/${2}_${HOSTNAME}"
@@ -108,7 +108,6 @@ $PYTHON_EXEC -u scripts/ray-vllm/evaluate.py \
     --worker_batch_size 1875 \
     --overwrite \
     --num_beams 32 --num_return_sequences 32 --num_return_thinking_sequences 1 \
-    # --sample_size 10 \
     $THINKING_ARGS >> "${BASE_LOG_NAME}.log" 2>&1
 echo "Ad task completed successfully"
 cleanup_gpu "$GPU_IDS"

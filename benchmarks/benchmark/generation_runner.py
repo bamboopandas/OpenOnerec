@@ -18,7 +18,6 @@ from typing import Dict, List, Optional, Any
 from pathlib import Path
 
 from benchmark.console import *
-# from scripts.ray-vllm.utils.generator import Generator
 from benchmark.base_generator import Generator
 from benchmark.tasks.v1_0.base_loader import BaseLoader
 
@@ -123,31 +122,6 @@ class GenerationRunner:
                 if not gens:
                     continue
                 
-                # Assume all candidates share the same CoT structure?
-                # Actually CoT is generated, so it might differ per candidate.
-                # If CoT differs, the "Amateur Context" differs per candidate.
-                # My `score` implementation supports one prompt per sample.
-                # If CoT differs per candidate, I need to treat each (sid, candidate_idx) as a unique sample for scoring.
-                # But `score` takes `prompts` and `completions`.
-                # If I have unique prompts per candidate, I can't use `score(prompts, completions)` directly 
-                # because `prompts` keys are sample_ids.
-                
-                # However, usually CoT is generated ONCE if we use `num_return_thinking_sequences=1`.
-                # But `RECOMMENDATION_GENERATION_CONFIG` has `num_return_sequences=128`.
-                # And `num_return_thinking_sequences=8`.
-                # Wait, usually the thinking part is shared?
-                # No, if we use beam search or sampling, different paths have different thinking.
-                
-                # The user says: "Generate item recommendations using the complete input (history, etc. + CoT) to build an 'expert model'".
-                # This implies CoT is part of the generation.
-                
-                # If CoT varies per candidate, the Amateur Prompt varies per candidate.
-                # I need to score (AmateurPrompt_i, Completion_i).
-                
-                # My `score` method assumes `prompts[sid]` is unique.
-                # I should modify the logic to handle unique prompts per candidate?
-                # OR, I can construct synthetic IDs: `sid_0`, `sid_1`...
-                
                 current_gens = gens
                 current_logprobs = logprobs.get(sid, [])
                 
@@ -155,35 +129,74 @@ class GenerationRunner:
                 processed_candidates = []
                 
                 for idx, text in enumerate(current_gens):
-                    # Parse CoT and Completion
-                    # Format: CoT <|sid_begin|> Completion
-                    parts = text.split(prompt_token)
-                    if len(parts) >= 2:
-                        cot = parts[0]
-                        # Join the rest in case prompt_token appears again (unlikely but safe)
-                        completion = prompt_token.join(parts[1:]) 
+                    # Robust parsing to extract Uncompressed CoT, Compressed CoT, and Completion
+                    # Expected structure from CompressedCoTGenerator:
+                    # <think>SUMMARY</think>\n<original_think>UNCOMPRESSED</original_think>\n{prompt_token}COMPLETION
+                    
+                    # 1. Extract Uncompressed CoT (for Amateur)
+                    uncompressed_cot = ""
+                    original_think_match = re.search(r"<original_think>(.*?)</original_think>", text, re.DOTALL)
+                    if original_think_match:
+                        uncompressed_cot = original_think_match.group(1).strip()
+                    
+                    # 2. Extract Compressed CoT (for Expert)
+                    compressed_cot_full = "" # Includes tags
+                    think_match = re.search(r"(<think>.*?</think>)", text, re.DOTALL)
+                    if think_match:
+                        compressed_cot_full = think_match.group(1)
+                    
+                    # 3. Extract Completion
+                    completion = ""
+                    
+                    if original_think_match:
+                        end_index = original_think_match.end()
+                        remainder = text[end_index:]
                         
-                        # Amateur Prompt: Masked Prompt + CoT + prompt_token
-                        # Mask history in the original prompt (replace SID blocks with fixed placeholder)
-                        original_prompt = prompts[sid]
-                        masked_prompt = re.sub(r'(?:<\|sid_begin\|>.*?<\|sid_end\|>[\s\n]*)+', ' <|history_masked|> ', original_prompt, flags=re.DOTALL)
-                        amateur_prompt = masked_prompt + cot + prompt_token
-                        
-                        # [DEBUG] Print amateur prompt example (once)
-                        if len(valid_sample_ids) == 0 and idx == 0:
-                            console.print(f"[DEBUG] Amateur Prompt Example:", style=warning_style)
-                            console.print(f"{amateur_prompt}", style=dim_style)
-                        
-                        # Use synthetic ID
-                        synth_id = f"{sid}___{idx}"
-                        amateur_prompts[synth_id] = amateur_prompt
-                        completions_map[synth_id] = [completion]
-                        
-                        processed_candidates.append({
-                            "original_text": text,
-                            "expert_score": current_logprobs[idx] if idx < len(current_logprobs) else 0.0,
-                            "synth_id": synth_id
-                        })
+                        # Expected: \n{prompt_token}COMPLETION
+                        if prompt_token:
+                             prefix_n = f"\n{prompt_token}"
+                             if remainder.startswith(prefix_n):
+                                 completion = remainder[len(prefix_n):]
+                             elif remainder.startswith(prompt_token):
+                                 completion = remainder[len(prompt_token):]
+                             else:
+                                 # Fallback
+                                 completion = remainder.split(prompt_token)[-1]
+                    else:
+                        # Fallback for standard generator
+                        parts = text.split(prompt_token)
+                        if len(parts) >= 2:
+                            completion = prompt_token.join(parts[1:])
+
+                    # Construct Prompts
+                    
+                    # Expert Prompt = Original Prompt + Compressed CoT
+                    expert_prompt = prompts.get(sid, "") + compressed_cot_full
+                    
+                    # Amateur Prompt = Masked Prompt + Original CoT
+                    # Masking logic
+                    def mask_semantic_ids(s):
+                        return re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", " <|history_masked|> ", s, flags=re.DOTALL)
+
+                    masked_original_prompt = mask_semantic_ids(prompts.get(sid, ""))
+                    # Mask history in CoT
+                    masked_cot = mask_semantic_ids(uncompressed_cot)
+                    
+                    amateur_prompt = masked_original_prompt + masked_cot
+                    
+                    synth_id = f"{sid}___{idx}"
+                    amateur_prompts[synth_id] = amateur_prompt
+                    completions_map[synth_id] = [completion]
+                    
+                    # Clean text for output (remove <original_think> and following newline)
+                    clean_text = re.sub(r"<original_think>.*?</original_think>\n?", "", text, flags=re.DOTALL)
+
+                    processed_candidates.append({
+                        "original_text": clean_text,
+                        "expert_score": current_logprobs[idx] if idx < len(current_logprobs) else 0.0,
+                        "synth_id": synth_id,
+                        "expert_prompt": expert_prompt
+                    })
                 
                 if processed_candidates:
                     valid_sample_ids.append((sid, processed_candidates))
@@ -194,7 +207,7 @@ class GenerationRunner:
                 amateur_scores, _ = generator.score(amateur_prompts, completions_map)
                 
                 # 2.5 Score with Baseline Model (Original Prompt without CoT)
-                # Baseline Prompt: Original Prompt + prompt_token
+                # Baseline Prompt: Original Prompt
                 baseline_prompts = {}
                 expert_prompts = {} # Re-score expert to ensure consistency (Use "logits" equivalent)
                 
@@ -206,24 +219,11 @@ class GenerationRunner:
                     for cand in candidates:
                         synth_id = cand["synth_id"]
                         
-                        # Baseline: Original Prompt + prompt_token
-                        baseline_prompts[synth_id] = prompts[sid] + prompt_token
+                        # Baseline: Original Prompt
+                        baseline_prompts[synth_id] = prompts[sid]
                         
-                        # Expert: Original Prompt + CoT + prompt_token
-                        # We need to reconstruct the Expert Prompt.
-                        # cand["original_text"] is the FULL text (CoT + prompt_token + Completion)?
-                        # No, generate() returns the text *generated*.
-                        # For Two-Stage with Thinking, the output from generate() (which is stage 2 result)
-                        # contains: <think>...</think>\n<|sid_begin|>SID_SEQUENCE
-                        # So, Expert Prompt should be: Original Prompt + CoT + prompt_token
-                        
-                        # Extract CoT from the generated text
-                        text = cand["original_text"]
-                        parts = text.split(prompt_token)
-                        if len(parts) >= 2:
-                            cot = parts[0] # Includes <think>...</think>\n
-                            # Expert Prompt = Original Prompt + CoT + prompt_token
-                            expert_prompts[synth_id] = prompts[sid] + cot + prompt_token
+                        # Expert: Original Prompt + Compressed CoT
+                        expert_prompts[synth_id] = cand["expert_prompt"]
 
                 # Debug: Print prompts for 3 random samples
                 try:
@@ -283,8 +283,8 @@ class GenerationRunner:
                         amateur_score_combined = amateur_val - baseline_val
 
                         # Contrastive Score: (1+alpha) * Expert - alpha * (Amateur - Baseline)
-                        final_score = (1 + alpha) * expert_val - alpha * amateur_val
-                        # final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
+                        # final_score = (1 + alpha) * expert_val - alpha * amateur_val
+                        final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
                         
                         reranked_candidates.append({
                             "text": cand["original_text"],
