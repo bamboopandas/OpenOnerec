@@ -1178,7 +1178,7 @@ class CompressedCoTGenerator(RayVllmGenerator):
             # Injecting compressed thought
             final_prompt = (
                 f"{original_prompt}"
-                f"<think>{summary}</think>\\n"
+                f"<think>{summary}</think>\n"
                 f"{prompt_token}"
             )
             final_prompts[sample_id] = final_prompt
@@ -1198,8 +1198,17 @@ class CompressedCoTGenerator(RayVllmGenerator):
             summary_id = f"{sample_id}_summary"
             summary = stage2_results[summary_id][0].strip()
             
+            # Retrieve uncompressed thought
+            uncompressed_thought = stage1_results[sample_id][0].strip()
+            
             # Construct the prefix
-            prefix = f"<think>{summary}</think>\\n{prompt_token}"
+            # We include <original_think> so that the Amateur Model (in GenerationRunner)
+            # can access the uncompressed thought if needed.
+            prefix = (
+                f"<think>{summary}</think>\n"
+                f"<original_think>{uncompressed_thought}</original_think>\n"
+                f"{prompt_token}"
+            )
             
             # Prepend to all beam answers
             final_answers = []

@@ -13,12 +13,10 @@ import json
 import os
 import time
 import re
-import random
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 
 from benchmark.console import *
-# from scripts.ray-vllm.utils.generator import Generator
 from benchmark.base_generator import Generator
 from benchmark.tasks.v1_0.base_loader import BaseLoader
 
@@ -225,27 +223,6 @@ class GenerationRunner:
                             # Expert Prompt = Original Prompt + CoT + prompt_token
                             expert_prompts[synth_id] = prompts[sid] + cot + prompt_token
 
-                # Debug: Print prompts for 3 random samples
-                try:
-                    all_keys = list(baseline_prompts.keys())
-                    if all_keys:
-                        debug_keys = random.sample(all_keys, min(3, len(all_keys)))
-                        console.print(f"\n[Contrastive Decoding DEBUG] Displaying prompts for {len(debug_keys)} samples:", style="bold cyan")
-                        for key in debug_keys:
-                            console.print(f"\n[Sample: {key}]", style="bold")
-                            
-                            console.print("Expert Prompt:", style="bold green")
-                            console.print(expert_prompts.get(key, "MISSING"))
-                            
-                            console.print("Amateur Prompt:", style="bold yellow")
-                            console.print(amateur_prompts.get(key, "MISSING"))
-                            
-                            console.print("Baseline Prompt:", style="bold blue")
-                            console.print(baseline_prompts.get(key, "MISSING"))
-                            console.print("-" * 40)
-                except Exception as e:
-                    console.print(f"[DEBUG ERROR] Failed to print debug prompts: {e}")
-
                 baseline_scores, _ = generator.score(baseline_prompts, completions_map)
                 expert_scores_recomputed, _ = generator.score(expert_prompts, completions_map)
                 
@@ -283,8 +260,7 @@ class GenerationRunner:
                         amateur_score_combined = amateur_val - baseline_val
 
                         # Contrastive Score: (1+alpha) * Expert - alpha * (Amateur - Baseline)
-                        final_score = (1 + alpha) * expert_val - alpha * amateur_val
-                        # final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
+                        final_score = (1 + alpha) * expert_val - alpha * amateur_score_combined
                         
                         reranked_candidates.append({
                             "text": cand["original_text"],

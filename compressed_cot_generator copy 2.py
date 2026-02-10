@@ -16,22 +16,29 @@ class CompressedCoTGenerator(RayVllmGenerator):
     def _extract_conclusion_heuristic(self, thought: str) -> str:
         """
         Extract the conclusion from the thought process using heuristics.
+        Logic:
+        1. Clean up tags.
+        2. Split into sentences.
+        3. Take the last non-empty sentence (conclusion).
+        4. If too short, append the one before it.
+        5. Strictly remove any Semantic ID markers.
+        6. Deduplicate keywords/phrases if present.
         """
-        # 1. Clean up tags (case-insensitive) - loop to handle nested/duplicate tags
-        text = thought
-        for _ in range(3): # Stricter cleaning
-            text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
+        # 1. Clean up tags
+        text = thought.replace("<think>", "").replace("</think>", "").strip()
         
-        # 2. Strictly remove Semantic ID patterns
+        # 2. Strictly remove Semantic ID patterns (just in case they exist in source thought)
+        # Pattern: <|sid_begin|>...<|sid_end|>
         text = re.sub(r"<\|sid_begin\|>.*?<\|sid_end\|>", "", text, flags=re.DOTALL)
+        # Also remove standalone tags
         text = text.replace("<|sid_begin|>", "").replace("<|sid_end|>", "")
         
-        original_len = len(text)
-        
-        # 3. Split into sentences
-        # Split by . ? ! ; 。 ？ ！ ； \n
+        # 3. Split into sentences (simple regex for Chinese/English punctuation)
+        # Split by . ? ! ; 。 ？ ！ ； 
+
         sentences = re.split(r'([.。?!;；？！\n])', text)
         
+        # Reconstruct sentences (delimiter is kept in odd positions)
         clean_sentences = []
         current = ""
         for part in sentences:
@@ -45,37 +52,38 @@ class CompressedCoTGenerator(RayVllmGenerator):
         if current.strip():
             clean_sentences.append(current.strip())
             
-        # 4. Extract Conclusion
         if not clean_sentences:
-            conclusion = text[-200:] if len(text) > 200 else text
-        elif len(clean_sentences) == 1:
-            conclusion = clean_sentences[0]
-            if len(conclusion) > 200:
-                conclusion = "..." + conclusion[-200:]
-        else:
-            # Take last 2 sentences
-            conclusion = " ".join(clean_sentences[-2:])
-            if len(conclusion) > 300: # Still too long? Take last sentence
-                conclusion = clean_sentences[-1]
-            if len(conclusion) > 300: # Still? Truncate
-                conclusion = "..." + conclusion[-200:]
+            return "Based on user history."
 
-        # 5. Intra-sentence deduplication
+        # 4. Extract Conclusion (Last 1-2 sentences)
+        conclusion = clean_sentences[-1]
+        
+        # If conclusion is too short (e.g., just "Therefore."), prepend previous sentence
+        if len(conclusion) < 15 and len(clean_sentences) > 1:
+            conclusion = clean_sentences[-2] + " " + conclusion
+            
+        # 5. Intra-sentence deduplication (for repetitive keywords)
+        # Split by comma (Eng/Chi), semicolon, enumeration comma, or multiple spaces
+        # This handles: "A, A", "A A", "A; A", "A、A"
         parts = re.split(r'[,，;；、\s]+', conclusion)
+        
         seen = set()
         deduped_parts = []
         for p in parts:
             p_clean = p.strip()
+            # Remove common list noise
             p_clean = re.sub(r'^(and|or|with|和|以及|与|的)\s*$', '', p_clean)
+            # Remove punctuation at ends
             p_clean = p_clean.strip('.。')
+            
             if p_clean and len(p_clean) > 1 and p_clean.lower() not in [x.lower() for x in seen]:
                 seen.add(p_clean)
                 deduped_parts.append(p_clean)
         
+        # Reconstruct if we actually had parts
         if deduped_parts:
             conclusion = ", ".join(deduped_parts)
             
-        console.print(f"[Heuristic] Original len: {original_len}, Summary len: {len(conclusion)}")
         return conclusion
 
     def generate(
@@ -105,10 +113,13 @@ class CompressedCoTGenerator(RayVllmGenerator):
         kwargs_stage1 = kwargs.copy()
         kwargs_stage1["stop"] = ["</think>"]
         kwargs_stage1["max_new_tokens"] = kwargs.get("max_new_thinking_tokens", 1024)
-        kwargs_stage1["num_beams"] = 1 
-        kwargs_stage1["num_return_sequences"] = 1 
+        kwargs_stage1["num_beams"] = 1 # Use sampling for diversity in thinking
+        kwargs_stage1["num_return_sequences"] = 1 # One thought per prompt for now
+        
+        # Add repetition_penalty to discourage loops in source thought
         kwargs_stage1["repetition_penalty"] = 1.1
         
+        # Call standard generation for Stage 1
         stage1_results, _, stage1_mfu = self._generate_standard(prompts, **kwargs_stage1)
         
         # --- Stage 2: Compress Thinking (Heuristic) ---
@@ -117,16 +128,22 @@ class CompressedCoTGenerator(RayVllmGenerator):
             style=warning_style,
         )
         
-        stage2_results = {}
+        # We do NOT use the model here. We use Python logic.
+        stage2_results = {} # Map summary_id -> [summary_text]
         summary_id_map = {}
         
         for sample_id, thoughts in stage1_results.items():
             thought = thoughts[0]
+            
+            # Apply Heuristic
             summary = self._extract_conclusion_heuristic(thought)
             
             summary_id = f"{sample_id}_summary"
             stage2_results[summary_id] = [summary]
             summary_id_map[summary_id] = sample_id
+
+        # No MFU for Stage 2 since it's CPU logic
+        stage2_mfu = {}
 
         # --- Stage 3: Beam Search with Compressed Thought ---
         console.print(
@@ -166,13 +183,8 @@ class CompressedCoTGenerator(RayVllmGenerator):
             summary_id = f"{sample_id}_summary"
             summary = stage2_results[summary_id][0].strip()
             
-            # Clean original thought of tags for cleaner embedding
-            original_thought = stage1_results[sample_id][0].strip()
-            original_thought = re.sub(r"</?think>", "", original_thought, flags=re.IGNORECASE).strip()
-            
             # Construct the prefix
-            # Include original thought for amateur model scoring in contrastive decoding
-            prefix = f"<original_think>{original_thought}</original_think><think>{summary}</think>\n{prompt_token}"
+            prefix = f"<think>{summary}</think>\n{prompt_token}"
             
             # Prepend to all beam answers
             final_answers = []

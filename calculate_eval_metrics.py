@@ -9,9 +9,11 @@ from typing import List, Dict, Set, Tuple
 K_VALUES = [1, 3, 5, 10, 16, 32]
 TASKS = ["ad", "product", "video"]
 # Modified BASE_DIR for OneRec-1.7B
-BASE_DIR = "benchmarks/results/v1.0_1000_thinktrue_temp_v5_0.5/results_results_1.7B/OneRec-1.7B/OneRec-1.7B" ##
+
+
+BASE_DIR = "benchmarks/results/v1.0_1000_try5090_chazhi_b_now/results_results_1.7B_victory/OneRec-1.7B/OneRec-1.7B" ##
 # Output file in the same directory as eval_results.json for OneRec-1.7B
-OUTPUT_FILE = "benchmarks/results/v1.0_1000_thinktrue_temp_v5_0.5/results_results_1.7B/OneRec-1.7B/eval_results_all.json"
+OUTPUT_FILE = "benchmarks/results/v1.0_1000_try5090_chazhi_b_now/results_results_1.7B_victory/OneRec-1.7B/eval_results_all.json"
 DATA_DIR = "raw_data/onerec_data/benchmark_data"
 
 # Constants for SID encoding
