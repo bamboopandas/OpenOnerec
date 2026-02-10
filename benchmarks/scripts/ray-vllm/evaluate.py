@@ -73,6 +73,7 @@ def main():
             presence_penalty=generation_config.presence_penalty,
             num_return_thinking_sequences=generation_config.num_return_thinking_sequences,
             sample_size=benchmark_config.sample_size,
+            cd_alpha=generation_config.cd_alpha,
         )
 
     finally:

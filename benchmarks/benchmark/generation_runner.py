@@ -223,6 +223,17 @@ class GenerationRunner:
                             # Expert Prompt = Original Prompt + CoT + prompt_token
                             expert_prompts[synth_id] = prompts[sid] + cot + prompt_token
 
+                # [DEBUG] Print prompt examples for the first sample
+                if valid_sample_ids:
+                    first_sid, first_candidates = valid_sample_ids[0]
+                    if first_candidates:
+                        first_synth_id = first_candidates[0]["synth_id"]
+                        console.print("\n[DEBUG] --- Prompt Examples for Score Calculation ---", style=warning_style)
+                        console.print(f"[EXPERT PROMPT]\n{expert_prompts.get(first_synth_id, 'N/A')}\n", style=dim_style)
+                        console.print(f"[AMATEUR PROMPT]\n{amateur_prompts.get(first_synth_id, 'N/A')}\n", style=dim_style)
+                        console.print(f"[BASELINE PROMPT]\n{baseline_prompts.get(first_synth_id, 'N/A')}\n", style=dim_style)
+                        console.print("-" * 50, style=warning_style)
+
                 baseline_scores, _ = generator.score(baseline_prompts, completions_map)
                 expert_scores_recomputed, _ = generator.score(expert_prompts, completions_map)
                 

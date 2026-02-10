@@ -116,6 +116,11 @@ class GenerationConfig:
         default=None,
         metadata={"help": "Number of thinking candidates to generate in stage 1"}
     )
+    # Contrastive Decoding
+    cd_alpha: Optional[float] = field(
+        default=0.5,
+        metadata={"help": "Alpha parameter for Contrastive Decoding"}
+    )
 
 
 @dataclass
