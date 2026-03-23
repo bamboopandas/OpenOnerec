@@ -7,15 +7,20 @@ set -e
 # ============================================================================
 # Cluster Configuration (auto-detect from Ray)
 # ============================================================================
-RAY_INFO=$(python -c "import ray; ray.init(address='auto', ignore_reinit_error=True); nodes = [n for n in ray.nodes() if n['Alive']]; gpus=next((int(n.get('Resources',{}).get('GPU',0)) for n in nodes if n.get('Resources',{}).get('GPU',0)>0), 0); print(f'{len(nodes)} {gpus}')" 2>/dev/null)
+RAY_INFO=$(python -c "import ray; ray.init(address='auto', ignore_reinit_error=True); nodes = [n for n in ray.nodes() if n['Alive']]; gpus=next((int(n.get('Resources',{}).get('GPU',0)) for n in nodes if n.get('Resources',{}).get('GPU',0)>0), 0); print(f'{len(nodes)} {gpus}')" 2>/dev/null || true)
 
-export N_NODES=$(echo $RAY_INFO | awk '{print $1}')
-export N_GPUS=$(echo $RAY_INFO | awk '{print $2}')
+export N_NODES=$(echo "$RAY_INFO" | awk '{print $1}')
+export N_GPUS=$(echo "$RAY_INFO" | awk '{print $2}')
 
 if [ -z "$N_NODES" ] || [ -z "$N_GPUS" ] || [ "$N_NODES" -eq 0 ]; then
-    echo "Could not detect Ray cluster. Using defaults: N_NODES=1, N_GPUS=8"
-    export N_NODES=1
-    export N_GPUS=8
+    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+        DEFAULT_N_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
+    else
+        DEFAULT_N_GPUS=8
+    fi
+    echo "Could not detect Ray cluster. Using fallback: N_NODES=1, N_GPUS=$DEFAULT_N_GPUS"
+    export N_NODES=${N_NODES:-1}
+    export N_GPUS=${N_GPUS:-$DEFAULT_N_GPUS}
 else
     echo "Detected Ray cluster: $N_NODES nodes, $N_GPUS GPUs per node"
 fi
@@ -64,6 +69,14 @@ export USE_FORCE_PREFIX=${USE_FORCE_PREFIX:-False}
 export DATA_DIR=${DATA_DIR:-"/path/to/your/data"}
 export TRAIN_FILES=${TRAIN_FILES:-"[$DATA_DIR/train.parquet]"}
 export VAL_FILES=${VAL_FILES:-"[$DATA_DIR/test.parquet]"}
+export JUDGE_BASE_URL=${JUDGE_BASE_URL:-"none"}
+export JUDGE_MODEL=${JUDGE_MODEL:-"none"}
+export RUBRIC_DIR=${RUBRIC_DIR:-"$DATA_DIR/rubrics"}
+export SIDECAR_INDEX_PATH=${SIDECAR_INDEX_PATH:-"$DATA_DIR/sidecar_index.parquet"}
+export REWARD_MAX_WORKERS=${REWARD_MAX_WORKERS:-16}
+export REWARD_TIMEOUT_S=${REWARD_TIMEOUT_S:-30}
+export RUBRIC_CONSENSUS_N=${RUBRIC_CONSENSUS_N:-1}
+export REWARD_MODE=${REWARD_MODE:-objective_rubric}
 
 # ============================================================================
 # Output Configuration
@@ -72,6 +85,7 @@ export PROJECT_NAME=${PROJECT_NAME:-"OneRec_RL"}
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-"grpo_two_stage"}
 export OUTPUT_DIR=${OUTPUT_DIR:-"./output"}
 export WANDB_MODE=${WANDB_MODE:-offline}
+export REWARD_CACHE_PATH=${REWARD_CACHE_PATH:-"$OUTPUT_DIR/reward_cache.sqlite"}
 
 # ============================================================================
 # Network Configuration (for distributed training)
@@ -94,6 +108,9 @@ echo "Rollout N: $ROLLOUT_N"
 echo "Stage2 Beam Size: $STAGE2_BEAM_SIZE"
 echo "Enable Think: $ENABLE_THINK"
 echo "Enable NonThink: $ENABLE_NONTHINK"
+echo "Judge Base URL: $JUDGE_BASE_URL"
+echo "Judge Model: $JUDGE_MODEL"
+echo "Reward Mode: $REWARD_MODE"
 echo "==================================="
 
 # ============================================================================
@@ -110,6 +127,7 @@ python3 -u -m recipe.onerec.main_onerec_ppo \
     ++data.enable_nonthink=$ENABLE_NONTHINK \
     ++data.use_force_prefix=$USE_FORCE_PREFIX \
     data.prompt_key='prompt' \
+    data.reward_fn_key='source' \
     data.shuffle=True \
     data.max_response_length=$RESPONSE_LENGTH \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
@@ -118,7 +136,17 @@ python3 -u -m recipe.onerec.main_onerec_ppo \
     data.custom_cls.path=$SCRIPT_DIR/onerec_recipe.py \
     data.custom_cls.name=OneRecDataset \
     custom_reward_function.path=$SCRIPT_DIR/onerec_recipe.py \
-    custom_reward_function.name=compute_score \
+    custom_reward_function.name=compute_score_batch \
+    reward_model.reward_manager=batch \
+    ++custom_reward_function.reward_kwargs.judge_base_url=$JUDGE_BASE_URL \
+    ++custom_reward_function.reward_kwargs.judge_model=$JUDGE_MODEL \
+    ++custom_reward_function.reward_kwargs.rubric_dir=$RUBRIC_DIR \
+    ++custom_reward_function.reward_kwargs.sidecar_index_path=$SIDECAR_INDEX_PATH \
+    ++custom_reward_function.reward_kwargs.cache_path=$REWARD_CACHE_PATH \
+    ++custom_reward_function.reward_kwargs.max_workers=$REWARD_MAX_WORKERS \
+    ++custom_reward_function.reward_kwargs.timeout_s=$REWARD_TIMEOUT_S \
+    ++custom_reward_function.reward_kwargs.consensus_n=$RUBRIC_CONSENSUS_N \
+    ++custom_reward_function.reward_kwargs.reward_mode=$REWARD_MODE \
     actor_rollout_ref.actor.use_dynamic_bsz=$USE_DYNAMIC_BSZ \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$MAX_TOKENS_PER_GPU \
     actor_rollout_ref.actor.ppo_mini_batch_size=$TRAIN_BATCH_SIZE \

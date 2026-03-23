@@ -23,6 +23,7 @@ import os
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from einops import rearrange
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -36,8 +37,17 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 
+def _missing_flash_attn(*args, **kwargs):
+    raise ModuleNotFoundError("flash_attn is required when use_remove_padding=True on CUDA.")
+
+
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    except ModuleNotFoundError:
+        index_first_axis = _missing_flash_attn
+        pad_input = _missing_flash_attn
+        unpad_input = _missing_flash_attn
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 

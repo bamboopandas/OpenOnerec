@@ -47,8 +47,17 @@ from tensordict import TensorDict
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.worker.worker_base import WorkerWrapperBase
+
+try:
+    from vllm.model_executor.sampling_metadata import SamplingMetadata
+except ModuleNotFoundError:
+    # vLLM >= 0.12 no longer exposes SamplingMetadata at the old path.
+    SamplingMetadata = Any
+
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ModuleNotFoundError:
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
 from verl.utils.profiler import GPUMemoryLogger

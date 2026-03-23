@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 import logging
 import os
 import re
@@ -16,11 +17,16 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
+from recipe.onerec.rubric_reward import (
+    compute_score as rubric_compute_score,
+    compute_score_batch as rubric_compute_score_batch,
+    parse_json_like,
+)
 from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["collate_fn", "OneRecDataset", "compute_score"]
+__all__ = ["collate_fn", "OneRecDataset", "compute_score", "compute_score_batch"]
 
 def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
     tensors: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -76,6 +82,8 @@ class OneRecDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.enable_think = config.get("enable_think", True)
         self.enable_nonthink = config.get("enable_nonthink", False)
+        self.shuffle = config.get("shuffle", True)
+        self.seed = config.get("seed", None)
 
         self.use_force_prefix = config.get("use_force_prefix", False)
         self._FORCE_PREFIX_CONTENT = "<think>\n</think><|sid_begin|>"
@@ -161,14 +169,44 @@ class OneRecDataset(Dataset):
 
 
         ground_truth_message = clean_chats[-1]["content"]
+        metadata = parse_json_like(row.get("metadata"), default={})
+        extra_info = parse_json_like(row.get("extra_info"), default={})
+        if not isinstance(extra_info, dict):
+            extra_info = {}
+        if not extra_info:
+            extra_info = {
+                "task_name": str(row.get("source", "unknown")),
+                "task_variant": str(row.get("source", "unknown")),
+                "schema_id": str(row.get("source", "unknown")),
+                "prompt_text": "\n".join(
+                    message["content"] for message in prompt_messages if message.get("content")
+                ),
+                "query_text": "",
+                "interaction_type": str(metadata.get("target_interaction", "")),
+                "history_item_captions": [],
+                "history_ad_captions": [],
+                "history_product_captions": [],
+                "ground_truth_sids": [],
+                "ground_truth_captions": [],
+                "context_version": "legacy",
+                "metadata": metadata,
+            }
+        else:
+            extra_info.setdefault("metadata", metadata)
+            extra_info.setdefault(
+                "prompt_text",
+                "\n".join(message["content"] for message in prompt_messages if message.get("content")),
+            )
 
         reward_payload = {
             "ground_truth": ground_truth_message,
-            "style": "rule",
+            "style": "rubric" if extra_info else "rule",
+            "schema_id": extra_info.get("schema_id", ""),
         }
 
         row[self.prompt_key] = prompt_messages
         row["reward_model"] = reward_payload
+        row["extra_info"] = extra_info
         return row
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset) -> datasets.Dataset:
@@ -330,7 +368,8 @@ class OneRecDataset(Dataset):
         if self.return_full_prompt:
             row["full_prompts"] = raw_prompt
 
-        extra_info = row.get("extra_info", {}) or {}
+        extra_info = parse_json_like(row.get("extra_info"), default={}) or {}
+        row["extra_info"] = extra_info
         row["index"] = extra_info.get("index", index)
         row["tools_kwargs"] = extra_info.get("tools_kwargs", {})
         row["interaction_kwargs"] = extra_info.get("interaction_kwargs", {})
@@ -536,31 +575,29 @@ def compute_score(
     data_source: str,  # noqa: ARG001
     solution_str: str,
     ground_truth: str,
-    extra_info: dict[str, Any],  # noqa: ARG001
-) -> dict[str, float]:
-    """Compute reward scores for recommendation results.
+    extra_info: dict[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    return rubric_compute_score(
+        data_source=data_source,
+        solution_str=solution_str,
+        ground_truth=ground_truth,
+        extra_info=extra_info,
+        **kwargs,
+    )
 
-    Args:
-        data_source: Data source identifier (kept for API compatibility).
-        solution_str: Model generated prediction text.
-        ground_truth: Ground truth text.
-        extra_info: Extra information (kept for API compatibility).
 
-    Returns:
-        Dictionary containing various reward scores.
-    """
-    prediction = solution_str
-    format_reward_value = think_format_reward(prediction)
-    partial_hit_reward_value = partial_hit_reward(prediction, ground_truth)
-    hit_reward_value = hit_reward(prediction, ground_truth)
-    pass_rate_value = pass_rate(prediction, ground_truth)
-    pass_at_1_value = first_sid_hit_reward(prediction, ground_truth)
-
-    return {
-        "score": pass_at_1_value,
-        "format_reward": format_reward_value,
-        "partial_hit_reward": partial_hit_reward_value,
-        "hit_reward": hit_reward_value,
-        "pass_rate": pass_rate_value,
-        "pass_at_1": pass_at_1_value,
-    }
+def compute_score_batch(
+    data_sources: list[str],
+    solution_strs: list[str],
+    ground_truths: list[str],
+    extra_infos: list[dict[str, Any] | str | None],
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    return rubric_compute_score_batch(
+        data_sources=data_sources,
+        solution_strs=solution_strs,
+        ground_truths=ground_truths,
+        extra_infos=extra_infos,
+        **kwargs,
+    )

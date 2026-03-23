@@ -19,6 +19,13 @@ OUTPUT_DIR="../output/rl_data"
 TEST_SIZE=1000
 SEED=42
 ENGINE="pyarrow"
+HISTORY_LIMIT=20
+CAPTION_MAX_CHARS=96
+
+# Optional sidecar inputs. Space-separated parquet paths.
+SID_MAPPING_FILES=${SID_MAPPING_FILES:-""}
+CAPTION_FILES=${CAPTION_FILES:-""}
+SIDECAR_INDEX_OUT=${SIDECAR_INDEX_OUT:-"sidecar_index.parquet"}
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,14 +68,32 @@ echo "Output directory: ${OUTPUT_DIR}"
 echo "Test set size: ${TEST_SIZE}"
 echo "=========================================="
 
-python3 "${SCRIPT_DIR}/scripts/train_test_split.py" \
+declare -a MAPPING_ARGS=()
+declare -a CAPTION_ARGS=()
+
+if [ -n "${SID_MAPPING_FILES}" ]; then
+    read -r -a MAPPING_FILE_ARRAY <<< "${SID_MAPPING_FILES}"
+    MAPPING_ARGS=(--mapping_files "${MAPPING_FILE_ARRAY[@]}")
+fi
+
+if [ -n "${CAPTION_FILES}" ]; then
+    read -r -a CAPTION_FILE_ARRAY <<< "${CAPTION_FILES}"
+    CAPTION_ARGS=(--caption_files "${CAPTION_FILE_ARRAY[@]}")
+fi
+
+python3 "${SCRIPT_DIR}/scripts/prepare_rubric_rl_data.py" \
     --input_files "${TASK_FILES[@]}" \
     --test_size "${TEST_SIZE}" \
     --output_dir "${OUTPUT_DIR}" \
     --seed "${SEED}" \
     --engine "${ENGINE}" \
     --test_filename "test.parquet" \
-    --train_filename "train.parquet"
+    --train_filename "train.parquet" \
+    --sidecar_index_out "${SIDECAR_INDEX_OUT}" \
+    --history_limit "${HISTORY_LIMIT}" \
+    --caption_max_chars "${CAPTION_MAX_CHARS}" \
+    "${MAPPING_ARGS[@]}" \
+    "${CAPTION_ARGS[@]}"
 
 echo ""
 echo "=========================================="
@@ -76,4 +101,5 @@ echo "RL data processing completed!"
 echo "Output directory: ${OUTPUT_DIR}"
 echo "  - train.parquet (training set)"
 echo "  - test.parquet (test set)"
+echo "  - ${SIDECAR_INDEX_OUT} (SID semantic sidecar)"
 echo "=========================================="
