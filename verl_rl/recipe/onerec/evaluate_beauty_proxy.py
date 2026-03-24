@@ -55,6 +55,14 @@ def _extract_ground_truth_ids(ground_truth: str) -> list[str]:
     return extract_sid_blocks(ground_truth)
 
 
+def _normalize_pid_list(values: Any) -> list[Any]:
+    if values is None:
+        return []
+    if isinstance(values, list):
+        return [value for value in values if value not in (None, "", 0, "0")]
+    return [values] if values not in ("", None, 0, "0") else []
+
+
 def _compute_recall_at_k(predicted_ids: list[str], ground_truth_ids: list[str], k: int) -> float:
     if not predicted_ids or not ground_truth_ids:
         return 0.0
@@ -92,6 +100,12 @@ def _compute_ndcg_at_k(predicted_ids: list[str], ground_truth_ids: list[str], k:
     if idcg == 0.0:
         return 0.0
     return dcg / idcg
+
+
+def _compute_position1_pass_at_k(predicted_ids: list[Any], first_ground_truth_id: Any, k: int) -> float:
+    if not predicted_ids or first_ground_truth_id in ("", None, 0, "0"):
+        return 0.0
+    return float(any(item == first_ground_truth_id for item in predicted_ids[:k] if item not in ("", None, 0, "0")))
 
 
 def _group_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -165,10 +179,14 @@ def evaluate_groups(
         ground_truth_ids = _extract_ground_truth_ids(ground_truth)
         ground_truth_set = set(ground_truth_ids)
         predicted_ids = [_first_sid(output) for output in outputs]
+        first_ground_truth_id = ground_truth_ids[0] if ground_truth_ids else ""
         top1_hit = float(bool(predicted_ids[:1] and predicted_ids[0] in ground_truth_set))
         beam_hit = float(bool(set(predicted_ids[:k]) & ground_truth_set))
         recall = _compute_recall_at_k(predicted_ids, ground_truth_ids, k)
         ndcg = _compute_ndcg_at_k(predicted_ids, ground_truth_ids, k)
+        ground_truth_pids = _normalize_pid_list(group.get("ground_truth_pids", []))
+        predicted_pids = _normalize_pid_list(group.get("predicted_pids", []))
+        first_ground_truth_pid = ground_truth_pids[0] if ground_truth_pids else None
 
         rubric_scores = list(group.get("rubric_scores", []))
         if rubric_scores:
@@ -191,8 +209,14 @@ def evaluate_groups(
         }
         for pass_k in pass_ks:
             sample_metrics[f"pass@{pass_k}"] = _compute_pass_at_k(predicted_ids, ground_truth_ids, pass_k)
+            sample_metrics[f"position1_pass@{pass_k}"] = _compute_position1_pass_at_k(predicted_ids, first_ground_truth_id, pass_k)
+            if ground_truth_pids and predicted_pids:
+                sample_metrics[f"pid_pass@{pass_k}"] = _compute_pass_at_k(predicted_pids, ground_truth_pids, pass_k)
+                sample_metrics[f"pid_position1_pass@{pass_k}"] = _compute_position1_pass_at_k(predicted_pids, first_ground_truth_pid, pass_k)
         if rubric_scores:
             sample_metrics["top1_rubric_score"] = rubric_scores[0] if rubric_scores else 0.0
+        if ground_truth_pids and predicted_pids:
+            sample_metrics[f"pid_recall@{k}"] = _compute_recall_at_k(predicted_pids, ground_truth_pids, k)
         per_sample.append(sample_metrics)
 
     summary: dict[str, float] = {
@@ -205,6 +229,13 @@ def evaluate_groups(
     }
     for pass_k in pass_ks:
         summary[f"pass@{pass_k}"] = mean([item[f"pass@{pass_k}"] for item in per_sample]) if per_sample else 0.0
+        summary[f"position1_pass@{pass_k}"] = mean([item[f"position1_pass@{pass_k}"] for item in per_sample]) if per_sample else 0.0
+
+    if per_sample and any(f"pid_recall@{k}" in item for item in per_sample):
+        summary[f"pid_recall@{k}"] = mean([item.get(f"pid_recall@{k}", 0.0) for item in per_sample])
+        for pass_k in pass_ks:
+            summary[f"pid_pass@{pass_k}"] = mean([item.get(f"pid_pass@{pass_k}", 0.0) for item in per_sample])
+            summary[f"pid_position1_pass@{pass_k}"] = mean([item.get(f"pid_position1_pass@{pass_k}", 0.0) for item in per_sample])
 
     top1_rubric_values = [item["top1_rubric_score"] for item in per_sample if "top1_rubric_score" in item]
     if top1_rubric_values:

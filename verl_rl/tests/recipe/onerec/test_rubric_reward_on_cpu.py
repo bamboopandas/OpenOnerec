@@ -4,7 +4,7 @@ import json
 
 import pandas as pd
 
-from recipe.onerec.rubric_reward import compute_rubric_only_score, compute_score_batch
+from recipe.onerec.rubric_reward import compute_rubric_only_score, compute_score_batch, parse_listwise_judge_response
 
 
 class FakeJudge:
@@ -192,3 +192,20 @@ def test_compute_rubric_only_score_skips_objective_metrics(tmp_path):
     assert result["rubric_score"] == 0.75
     assert "score" not in result
     assert "objective_anchor" not in result
+
+
+def test_parse_listwise_judge_response_recovers_partial_ranking():
+    raw_response = """
+    {
+      "ranking": [
+        {"candidate_index": 2, "score": 0.9, "reason": "更相关"},
+        {"candidate_index": 1, "score": 0.3, "reason": "次之"}
+      ],
+      "judge_reason": "ok"
+    """
+
+    result = parse_listwise_judge_response(raw_response, candidate_count=3)
+
+    assert [item["candidate_index"] for item in result.ranking] == [2, 1, 3]
+    assert result.ranking[0]["score"] == 0.9
+    assert result.judge_reason == "ok"

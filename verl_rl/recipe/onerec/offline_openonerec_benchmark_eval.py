@@ -5,21 +5,24 @@ import ast
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+try:
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional dependency in local envs
+    pq = None
+
 from recipe.onerec.evaluate_beauty_proxy import evaluate_groups
 from recipe.onerec.rubric_reward import (
-    build_judge_prompt,
-    compute_rubric_only_score,
+    compute_listwise_rubric_rerank,
     extract_sid_blocks as extract_candidate_sid_blocks,
     get_offline_hf_judge_client,
-    load_rubric,
     load_sidecar_index,
     parse_json_like,
-    resolve_predicted_items,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,22 +93,61 @@ def _parse_json_like(raw_value: Any, default: Any) -> Any:
 
 
 def _guess_pid_column(df: pd.DataFrame) -> str:
-    for column in PID_COLUMN_CANDIDATES:
-        if column in df.columns:
-            return column
-    raise ValueError(f"Unable to find pid-like column in columns: {list(df.columns)}")
+    return _guess_pid_column_from_columns(list(df.columns))
 
 
 def _guess_caption_column(df: pd.DataFrame) -> str:
+    return _guess_caption_column_from_columns(list(df.columns), _guess_pid_column(df))
+
+
+def _guess_pid_column_from_columns(columns: list[str]) -> str:
+    for column in PID_COLUMN_CANDIDATES:
+        if column in columns:
+            return column
+    raise ValueError(f"Unable to find pid-like column in columns: {columns}")
+
+
+def _guess_caption_column_from_columns(columns: list[str], pid_column: str) -> str:
     for column in CAPTION_COLUMN_CANDIDATES:
-        if column in df.columns:
+        if column in columns:
             return column
-    for column in df.columns:
-        if column == _guess_pid_column(df):
-            continue
-        if df[column].dtype == object:
+    for column in columns:
+        if column != pid_column:
             return column
-    raise ValueError(f"Unable to find caption-like column in columns: {list(df.columns)}")
+    raise ValueError(f"Unable to find caption-like column in columns: {columns}")
+
+
+def _parquet_columns(path: str) -> list[str]:
+    if pq is not None:
+        parquet_file = pq.ParquetFile(path)
+        arrow_schema = getattr(parquet_file, "schema_arrow", None)
+        if arrow_schema is not None:
+            return list(arrow_schema.names)
+        return list(parquet_file.schema.names)
+
+    empty_df = pd.read_parquet(path, columns=[])
+    return list(empty_df.columns)
+
+
+def _read_parquet_subset(
+    path: str,
+    *,
+    columns: list[str] | None = None,
+    filters: list[tuple[str, str, Any]] | None = None,
+) -> pd.DataFrame:
+    kwargs: dict[str, Any] = {}
+    if columns is not None:
+        kwargs["columns"] = columns
+    if filters:
+        kwargs["filters"] = filters
+    try:
+        return pd.read_parquet(path, **kwargs)
+    except Exception as exc:
+        if filters:
+            logger.warning("read_parquet with filters failed for %s: %s; retrying without filters", path, exc)
+            kwargs.pop("filters", None)
+            return pd.read_parquet(path, **kwargs)
+        raise
 
 
 def _codes_to_sid(codes: Any) -> str:
@@ -161,18 +203,33 @@ def _build_sidecar_index(
     for mapping_file in mapping_files:
         if not mapping_file:
             continue
-        mapping_df = pd.read_parquet(mapping_file)
-        pid_column = _guess_pid_column(mapping_df)
-        if "sid" in mapping_df.columns:
+        mapping_columns = _parquet_columns(mapping_file)
+        pid_column = _guess_pid_column_from_columns(mapping_columns)
+        sid_column = "sid" if "sid" in mapping_columns else "codes" if "codes" in mapping_columns else ""
+        if not sid_column:
+            raise ValueError(f"Mapping parquet {mapping_file} must contain `sid` or `codes` column")
+        logger.info(
+            "Loading mapping parquet %s with columns=%s allowed_sids=%d",
+            mapping_file,
+            [pid_column, sid_column],
+            len(allowed_sids) if allowed_sids is not None else -1,
+        )
+        started_at = time.perf_counter()
+        mapping_df = _read_parquet_subset(mapping_file, columns=[pid_column, sid_column])
+        logger.info(
+            "Loaded mapping parquet %s rows=%d in %.2fs",
+            mapping_file,
+            len(mapping_df),
+            time.perf_counter() - started_at,
+        )
+        if sid_column == "sid":
             sid_series = mapping_df["sid"].map(_sid_value_to_sid)
             if allowed_sids is not None:
                 keep_mask = sid_series.isin(allowed_sids)
                 mapping_df = mapping_df[keep_mask]
                 sid_series = sid_series[keep_mask]
-        elif "codes" in mapping_df.columns:
-            sid_series = mapping_df["codes"].map(_sid_value_to_sid)
         else:
-            raise ValueError(f"Mapping parquet {mapping_file} must contain `sid` or `codes` column")
+            sid_series = mapping_df["codes"].map(_sid_value_to_sid)
 
         for pid, sid in zip(mapping_df[pid_column], sid_series, strict=False):
             sid = str(sid).strip() if sid is not None else ""
@@ -208,21 +265,41 @@ def _build_pid_caption_lookup(
     allowed_pids: set[Any] | None = None,
 ) -> dict[Any, str]:
     lookup: dict[Any, str] = {}
+    if allowed_pids is not None and not allowed_pids:
+        return lookup
     for caption_file in caption_files:
         if not caption_file:
             continue
-        caption_df = pd.read_parquet(caption_file)
-        pid_column = _guess_pid_column(caption_df)
-        caption_column = _guess_caption_column(caption_df)
+        caption_columns = _parquet_columns(caption_file)
+        pid_column = _guess_pid_column_from_columns(caption_columns)
+        caption_column = _guess_caption_column_from_columns(caption_columns, pid_column)
+        filters = None
         if allowed_pids is not None:
-            caption_df = caption_df[caption_df[pid_column].isin(allowed_pids)]
-        for _, row in caption_df[[pid_column, caption_column]].dropna().iterrows():
-            pid = row[pid_column]
-            if allowed_pids is not None and pid not in allowed_pids:
-                continue
+            filters = [(pid_column, "in", list(allowed_pids))]
+        logger.info(
+            "Loading caption parquet %s with columns=%s allowed_pids=%d",
+            caption_file,
+            [pid_column, caption_column],
+            len(allowed_pids) if allowed_pids is not None else -1,
+        )
+        started_at = time.perf_counter()
+        caption_df = _read_parquet_subset(
+            caption_file,
+            columns=[pid_column, caption_column],
+            filters=filters,
+        )
+        logger.info(
+            "Loaded caption parquet %s rows=%d in %.2fs",
+            caption_file,
+            len(caption_df),
+            time.perf_counter() - started_at,
+        )
+        caption_df = caption_df[[pid_column, caption_column]].dropna().drop_duplicates(subset=[pid_column])
+        for row in caption_df.itertuples(index=False):
+            pid = getattr(row, pid_column)
             if pid in lookup:
                 continue
-            caption = _truncate_text(row[caption_column], caption_max_chars)
+            caption = _truncate_text(getattr(row, caption_column), caption_max_chars)
             if caption:
                 lookup[pid] = caption
     return lookup
@@ -399,6 +476,7 @@ def _build_extra_info(
         "history_ad_captions": history_ad_captions[:history_limit],
         "history_product_captions": history_product_captions[:history_limit],
         "ground_truth_sids": ground_truth_sids[:history_limit],
+        "ground_truth_pids": ground_truth_pids[:history_limit],
         "ground_truth_captions": ground_truth_captions[:history_limit],
         "context_version": CONTEXT_VERSION,
         "prompt_text": user_text,
@@ -481,6 +559,7 @@ def _sort_candidates_by_rubric(candidates: list[dict[str, Any]]) -> list[dict[st
     return sorted(
         candidates,
         key=lambda candidate: (
+            int(candidate.get("listwise_rank", 10**9)),
             -float(candidate.get("rubric_score", 0.0)),
             int(candidate.get("raw_rank", 0)),
         ),
@@ -492,19 +571,18 @@ def _first_candidate_sid(output: str) -> str:
     return sid_blocks[0] if sid_blocks else ""
 
 
-def _is_rerankable(outputs: list[str], ground_truth: str) -> bool:
-    ground_truth_set = set(_extract_sid_blocks(ground_truth))
-    if not ground_truth_set:
-        return False
-    predicted_ids = [_first_candidate_sid(output) for output in outputs]
-    return any(predicted_id in ground_truth_set for predicted_id in predicted_ids if predicted_id)
-
-
-def _build_group(prompt: str, ground_truth: str, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_group(
+    prompt: str,
+    ground_truth: str,
+    ground_truth_pids: list[Any],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "input": prompt,
         "ground_truth": ground_truth,
+        "ground_truth_pids": list(ground_truth_pids),
         "outputs": [candidate["output"] for candidate in candidates],
+        "predicted_pids": [candidate.get("predicted_pid") for candidate in candidates],
         "rubric_scores": [candidate["rubric_score"] for candidate in candidates],
         "unresolved_sid_ratios": [candidate["unresolved_sid_ratio"] for candidate in candidates],
     }
@@ -521,7 +599,7 @@ def _select_summary_keys(summary: dict[str, float], prefixes: tuple[str, ...]) -
 def _compute_delta(raw_summary: dict[str, float], rerank_summary: dict[str, float]) -> dict[str, float]:
     delta: dict[str, float] = {}
     for key in set(raw_summary) & set(rerank_summary):
-        if key.startswith(("pass@", "recall@", "ndcg@", "beam_hit@")) or key == "top1_hit":
+        if key.startswith(("pass@", "position1_pass@", "recall@", "ndcg@", "beam_hit@", "pid_pass@", "pid_position1_pass@", "pid_recall@")) or key == "top1_hit":
             delta[key] = rerank_summary[key] - raw_summary.get(key, 0.0)
     return delta
 
@@ -535,21 +613,17 @@ def summarize_candidate_pool_records(
 ) -> dict[str, Any]:
     raw_groups: list[dict[str, Any]] = []
     rerank_groups: list[dict[str, Any]] = []
-    rerankable_raw_groups: list[dict[str, Any]] = []
-    rerankable_rerank_groups: list[dict[str, Any]] = []
 
     for record in candidate_pool_records:
         prompt = str(record.get("prompt", ""))
         ground_truth = str(record.get("ground_truth", ""))
+        ground_truth_pids = _parse_pid_sequence(record.get("ground_truth_pids"))
         raw_candidates = list(record.get("candidates", []))
         reranked_candidates = _sort_candidates_by_rubric(raw_candidates)
-        raw_group = _build_group(prompt, ground_truth, raw_candidates)
-        rerank_group = _build_group(prompt, ground_truth, reranked_candidates)
+        raw_group = _build_group(prompt, ground_truth, ground_truth_pids, raw_candidates)
+        rerank_group = _build_group(prompt, ground_truth, ground_truth_pids, reranked_candidates)
         raw_groups.append(raw_group)
         rerank_groups.append(rerank_group)
-        if _is_rerankable(raw_group["outputs"], ground_truth):
-            rerankable_raw_groups.append(raw_group)
-            rerankable_rerank_groups.append(rerank_group)
 
     coverage_summary, _ = evaluate_groups(
         raw_groups,
@@ -558,23 +632,13 @@ def summarize_candidate_pool_records(
     )
     all_raw_summary, _ = evaluate_groups(raw_groups, k=k, pass_ks=pass_ks)
     all_rerank_summary, _ = evaluate_groups(rerank_groups, k=k, pass_ks=pass_ks)
-    rerankable_raw_summary, _ = evaluate_groups(rerankable_raw_groups, k=k, pass_ks=pass_ks)
-    rerankable_rerank_summary, _ = evaluate_groups(rerankable_rerank_groups, k=k, pass_ks=pass_ks)
 
     return {
         "num_total_examples": len(candidate_pool_records),
-        "num_rerank_examples": len(rerankable_raw_groups),
         "candidate_coverage": _select_summary_keys(coverage_summary, ("pass@",)),
-        "all_examples": {
-            "raw_ranking": all_raw_summary,
-            "rubric_rerank": all_rerank_summary,
-            "delta": _compute_delta(all_raw_summary, all_rerank_summary),
-        },
-        "rerankable_subset": {
-            "raw_ranking": rerankable_raw_summary,
-            "rubric_rerank": rerankable_rerank_summary,
-            "delta": _compute_delta(rerankable_raw_summary, rerankable_rerank_summary),
-        },
+        "raw_ranking": all_raw_summary,
+        "rubric_rerank": all_rerank_summary,
+        "delta": _compute_delta(all_raw_summary, all_rerank_summary),
     }
 
 
@@ -608,13 +672,21 @@ def _score_samples(
     pass_ks: list[int],
     coverage_ks: list[int],
 ) -> dict[str, Any]:
+    logger.info("Loading sidecar lookup from %s", sidecar_index_path)
+    started_at = time.perf_counter()
     sidecar_lookup = load_sidecar_index(sidecar_index_path)
+    logger.info("Loaded sidecar lookup with %d rows in %.2fs", len(sidecar_lookup), time.perf_counter() - started_at)
     predicted_pids = {record.get("pid") for record in sidecar_lookup.values() if record.get("pid") is not None}
+    logger.info("Building pid-caption lookup for %d context/candidate pids", len(set(context_pids) | predicted_pids))
+    started_at = time.perf_counter()
     pid_caption_lookup = _build_pid_caption_lookup(
         caption_files,
         caption_max_chars,
         allowed_pids=set(context_pids) | predicted_pids,
     )
+    logger.info("Built pid-caption lookup with %d rows in %.2fs", len(pid_caption_lookup), time.perf_counter() - started_at)
+    logger.info("Initializing offline judge model from %s", judge_model_path)
+    started_at = time.perf_counter()
     judge_impl = get_offline_hf_judge_client(
         judge_model=judge_model_path,
         max_new_tokens=judge_max_new_tokens,
@@ -622,6 +694,7 @@ def _score_samples(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
     )
+    logger.info("Initialized offline judge model in %.2fs", time.perf_counter() - started_at)
 
     details: list[dict[str, Any]] = []
     candidate_pool_records: list[dict[str, Any]] = []
@@ -643,61 +716,41 @@ def _score_samples(
             caption_max_chars=caption_max_chars,
         )
         schema_id = str(extra_info.get("schema_id", task_name))
-        rubric = load_rubric(schema_id, rubric_dir)
-        rubric_snapshot[schema_id] = rubric
-
-        raw_candidates: list[dict[str, Any]] = []
-        for rank, output in enumerate(sample.get("generations", []), start=1):
-            predicted_items, _ = resolve_predicted_items(str(output), sidecar_lookup)
-            judge_prompt = build_judge_prompt(
-                schema_id=schema_id,
-                rubric=rubric,
-                extra_info=extra_info,
-                predicted_items=predicted_items,
-                raw_prediction=str(output),
-            )
-            judge_prompts.append(
-                {
-                    "sample_id": sample_id,
-                    "uuid": metadata.get("uuid", ""),
-                    "task_name": task_name,
-                    "raw_rank": rank,
-                    "schema_id": schema_id,
-                    "candidate_output": output,
-                    "judge_prompt": judge_prompt,
-                    "rubric": rubric,
-                }
-            )
-            rubric_payload = compute_rubric_only_score(
-                solution_str=str(output),
-                extra_info=extra_info,
-                rubric_dir=rubric_dir,
-                sidecar_index_path=sidecar_index_path,
-                cache_path=cache_path,
-                timeout_s=60,
-                consensus_n=1,
-                judge_backend="offline_hf",
-                judge_model=judge_model_path,
-                judge_max_new_tokens=judge_max_new_tokens,
-                judge_device_map=device_map,
-                judge_torch_dtype=torch_dtype,
-                judge_attn_implementation=attn_implementation,
-                judge_impl=judge_impl,
-            )
-            raw_candidates.append(
-                {
-                    "output": output,
-                    "raw_rank": rank,
-                    "rubric_score": float(rubric_payload["rubric_score"]),
-                    "judge_reason": rubric_payload["judge_reason"],
-                    "unresolved_sid_ratio": float(rubric_payload["unresolved_sid_ratio"]),
-                    "cache_hit": float(rubric_payload["cache_hit"]),
-                    "rubric_applied": float(rubric_payload["rubric_applied"]),
-                }
-            )
-
+        rerank_payload = compute_listwise_rubric_rerank(
+            predictions=[str(output) for output in sample.get("generations", [])],
+            extra_info=extra_info,
+            rubric_dir=rubric_dir,
+            sidecar_lookup=sidecar_lookup,
+            cache_path=cache_path,
+            timeout_s=60,
+            judge_backend="offline_hf",
+            judge_model=judge_model_path,
+            judge_max_new_tokens=judge_max_new_tokens,
+            judge_device_map=device_map,
+            judge_torch_dtype=torch_dtype,
+            judge_attn_implementation=attn_implementation,
+            judge_impl=judge_impl,
+        )
+        rubric_snapshot[schema_id] = rerank_payload["rubric"]
+        raw_candidates = rerank_payload["candidates"]
         reranked_candidates = _sort_candidates_by_rubric(raw_candidates)
-        rerankable = _is_rerankable([candidate["output"] for candidate in raw_candidates], ground_truth)
+
+        judge_prompts.append(
+            {
+                "sample_id": sample_id,
+                "uuid": metadata.get("uuid", ""),
+                "task_name": task_name,
+                "schema_id": schema_id,
+                "candidate_count": len(raw_candidates),
+                "judge_prompt": rerank_payload["judge_prompt"],
+                "judge_response": rerank_payload["judge_response"],
+                "judge_reason": rerank_payload["judge_reason"],
+                "cache_hit": float(rerank_payload["cache_hit"]),
+                "rubric_applied": float(rerank_payload["rubric_applied"]),
+                "rubric": rerank_payload["rubric"],
+            }
+        )
+
         candidate_pool_records.append(
             {
                 "sample_id": sample_id,
@@ -705,9 +758,9 @@ def _score_samples(
                 "task_name": task_name,
                 "prompt": sample.get("prompt", ""),
                 "ground_truth": ground_truth,
+                "ground_truth_pids": extra_info.get("ground_truth_pids", []),
                 "extra_info": extra_info,
                 "candidates": raw_candidates,
-                "rerankable": rerankable,
             }
         )
         details.append(
@@ -718,7 +771,11 @@ def _score_samples(
                 "extra_info": extra_info,
                 "ground_truth": ground_truth,
                 "prompt": sample.get("prompt", ""),
-                "rerankable": rerankable,
+                "listwise_judge": {
+                    "judge_reason": rerank_payload["judge_reason"],
+                    "cache_hit": float(rerank_payload["cache_hit"]),
+                    "rubric_applied": float(rerank_payload["rubric_applied"]),
+                },
                 "raw_ranking": raw_candidates,
                 "rubric_rerank": [
                     {

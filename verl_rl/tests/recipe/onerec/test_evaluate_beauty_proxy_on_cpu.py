@@ -17,6 +17,8 @@ def test_evaluate_groups_computes_beauty_proxy_metrics():
             "rubric_scores": [0.9, 0.2],
             "objective_anchors": [1.0, 0.0],
             "unresolved_sid_ratios": [0.0, 0.0],
+            "ground_truth_pids": [101],
+            "predicted_pids": [101, 202],
         },
         {
             "input": "sample-2",
@@ -28,6 +30,8 @@ def test_evaluate_groups_computes_beauty_proxy_metrics():
             "rubric_scores": [0.1, 0.8],
             "objective_anchors": [0.0, 1.0],
             "unresolved_sid_ratios": [0.0, 0.0],
+            "ground_truth_pids": [202],
+            "predicted_pids": [101, 202],
         },
     ]
 
@@ -36,10 +40,14 @@ def test_evaluate_groups_computes_beauty_proxy_metrics():
     assert len(per_sample) == 2
     assert summary["top1_hit"] == 0.5
     assert summary["pass@1"] == 0.5
+    assert summary["position1_pass@1"] == 0.5
     assert summary["pass@5"] == 1.0
     assert summary["pass@10"] == 1.0
     assert summary["beam_hit@10"] == 1.0
     assert summary["recall@10"] == 1.0
+    assert summary["pid_pass@1"] == 0.5
+    assert summary["pid_position1_pass@1"] == 0.5
+    assert summary["pid_recall@10"] == 1.0
     assert round(summary["ndcg@10"], 6) == round((1.0 + (1.0 / 1.584962500721156)) / 2.0, 6)
     assert summary["hit_minus_miss_rubric_gap"] > 0.0
 

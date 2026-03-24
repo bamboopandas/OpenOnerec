@@ -11,15 +11,13 @@ from recipe.onerec import offline_openonerec_benchmark_eval as benchmark_eval
 
 class FakeJudge:
     def generate(self, prompt: str) -> str:
-        satisfied = "命中商品标题" in prompt
-        score = 0.9 if satisfied else 0.1
+        assert "candidates" in prompt
         return json.dumps(
             {
-                "criterion_results": [
-                    {"criterion": "c1", "satisfied": satisfied, "evidence": "ok"},
-                    {"criterion": "c2", "satisfied": False, "evidence": "skip"},
+                "ranking": [
+                    {"candidate_index": 2, "score": 0.95, "reason": "更相关"},
+                    {"candidate_index": 1, "score": 0.10, "reason": "无关"},
                 ],
-                "rubric_score": score,
                 "judge_reason": "ranked",
             },
             ensure_ascii=False,
@@ -127,12 +125,21 @@ def test_offline_openonerec_benchmark_eval_reranks_raw_candidates(tmp_path):
         benchmark_eval.get_offline_hf_judge_client = original_factory
 
     assert summary["num_total_examples"] == 1
-    assert summary["num_rerank_examples"] == 1
     assert summary["candidate_coverage"]["pass@2"] == 1.0
-    assert summary["all_examples"]["raw_ranking"]["pass@1"] == 0.0
-    assert summary["all_examples"]["raw_ranking"]["pass@2"] == 1.0
-    assert summary["all_examples"]["rubric_rerank"]["pass@1"] == 1.0
-    assert summary["rerankable_subset"]["delta"]["pass@1"] == 1.0
+    assert summary["raw_ranking"]["pass@1"] == 0.0
+    assert summary["raw_ranking"]["pass@2"] == 1.0
+    assert summary["raw_ranking"]["pid_pass@1"] == 0.0
+    assert summary["rubric_rerank"]["pass@1"] == 1.0
+    assert summary["rubric_rerank"]["pid_pass@1"] == 1.0
+    assert summary["delta"]["pass@1"] == 1.0
+    judge_prompt_records = [
+        json.loads(line)
+        for line in (tmp_path / "output" / "judge_prompts.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert judge_prompt_records
+    assert judge_prompt_records[0]["candidate_count"] == 2
+    assert "ground_truth_captions" not in judge_prompt_records[0]["judge_prompt"]
     assert (tmp_path / "output" / "details.json").exists()
     assert (tmp_path / "output" / "rubric_snapshot.json").exists()
     assert (tmp_path / "output" / "judge_prompts.jsonl").exists()
@@ -160,6 +167,37 @@ def test_load_generation_samples_supports_shards(tmp_path):
 def test_sid_value_to_sid_supports_array_like_sid():
     sid = benchmark_eval._sid_value_to_sid([700, 5323, 6150])
     assert sid == "<|sid_begin|><s_a_700><s_b_5323><s_c_6150><|sid_end|>"
+
+
+def test_build_pid_caption_lookup_uses_column_pruning_and_filters():
+    calls: list[dict[str, object]] = []
+    original_read_parquet = benchmark_eval.pd.read_parquet
+    original_parquet_columns = benchmark_eval._parquet_columns
+
+    def fake_read_parquet(path, **kwargs):
+        calls.append({"path": path, **kwargs})
+        return pd.DataFrame([{"pid": 11, "caption": "标题A"}, {"pid": 12, "caption": "标题B"}])
+
+    benchmark_eval.pd.read_parquet = fake_read_parquet
+    benchmark_eval._parquet_columns = lambda _: ["pid", "caption", "unused"]
+    try:
+        lookup = benchmark_eval._build_pid_caption_lookup(
+            ["fake_caption.parquet"],
+            caption_max_chars=96,
+            allowed_pids={11, 12},
+        )
+    finally:
+        benchmark_eval.pd.read_parquet = original_read_parquet
+        benchmark_eval._parquet_columns = original_parquet_columns
+
+    assert lookup == {11: "标题A", 12: "标题B"}
+    assert len(calls) == 1
+    assert calls[0]["columns"] == ["pid", "caption"]
+    filters = calls[0]["filters"]
+    assert isinstance(filters, list) and len(filters) == 1
+    assert filters[0][0] == "pid"
+    assert filters[0][1] == "in"
+    assert set(filters[0][2]) == {11, 12}
 
 
 def test_merge_openonerec_benchmark_rerank_merges_shards(tmp_path):
@@ -220,8 +258,7 @@ def test_merge_openonerec_benchmark_rerank_merges_shards(tmp_path):
 
     merged_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert merged_summary["num_total_examples"] == 2
-    assert merged_summary["num_rerank_examples"] == 2
-    assert merged_summary["all_examples"]["raw_ranking"]["pass@1"] == 0.5
-    assert merged_summary["all_examples"]["rubric_rerank"]["pass@1"] == 1.0
+    assert merged_summary["raw_ranking"]["pass@1"] == 0.5
+    assert merged_summary["rubric_rerank"]["pass@1"] == 1.0
     assert (output_dir / "judge_prompts.jsonl").exists()
     assert (output_dir / "rubric_snapshot.json").exists()

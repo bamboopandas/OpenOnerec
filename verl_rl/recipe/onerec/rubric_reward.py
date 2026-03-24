@@ -214,6 +214,12 @@ class JudgeResult:
     judge_reason: str
 
 
+@dataclass
+class ListwiseJudgeResult:
+    ranking: list[dict[str, Any]]
+    judge_reason: str
+
+
 class SqliteJudgeCache:
     def __init__(self, path: str) -> None:
         self.path = path
@@ -477,14 +483,8 @@ def get_judge_client(
         return None
 
 
-def build_judge_prompt(
-    schema_id: str,
-    rubric: list[dict[str, Any]],
-    extra_info: dict[str, Any],
-    predicted_items: list[dict[str, Any]],
-    raw_prediction: str,
-) -> str:
-    context = {
+def _build_prompt_context(extra_info: dict[str, Any]) -> dict[str, Any]:
+    return {
         "task_name": extra_info.get("task_name", ""),
         "task_variant": extra_info.get("task_variant", ""),
         "query_text": extra_info.get("query_text", ""),
@@ -493,9 +493,17 @@ def build_judge_prompt(
         "history_item_captions": extra_info.get("history_item_captions", []),
         "history_ad_captions": extra_info.get("history_ad_captions", []),
         "history_product_captions": extra_info.get("history_product_captions", []),
-        "ground_truth_captions": extra_info.get("ground_truth_captions", []),
     }
 
+
+def build_judge_prompt(
+    schema_id: str,
+    rubric: list[dict[str, Any]],
+    extra_info: dict[str, Any],
+    predicted_items: list[dict[str, Any]],
+    raw_prediction: str,
+) -> str:
+    context = _build_prompt_context(extra_info)
     rubric_json = json.dumps(rubric, ensure_ascii=False, indent=2)
     context_json = json.dumps(context, ensure_ascii=False, indent=2)
     items_json = json.dumps(predicted_items, ensure_ascii=False, indent=2)
@@ -534,6 +542,74 @@ raw_model_response:
     }}
   ],
   "rubric_score": 0.0,
+  "judge_reason": "..."
+}}
+"""
+
+
+def build_listwise_judge_prompt(
+    schema_id: str,
+    rubric: list[dict[str, Any]],
+    extra_info: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> str:
+    context_json = json.dumps(_build_prompt_context(extra_info), ensure_ascii=False, indent=2)
+    rubric_json = json.dumps(rubric, ensure_ascii=False, indent=2)
+
+    candidate_payload: list[dict[str, Any]] = []
+    for candidate in candidates:
+        semantic_items = []
+        for item in candidate.get("predicted_items", []):
+            semantic_items.append(
+                {
+                    "pid": item.get("pid"),
+                    "caption": str(item.get("caption", "")).strip(),
+                    "semantic_available": bool(str(item.get("caption", "")).strip()),
+                }
+            )
+        candidate_payload.append(
+            {
+                "candidate_index": int(candidate.get("candidate_index", 0)),
+                "raw_rank": int(candidate.get("raw_rank", 0)),
+                "semantic_items": semantic_items,
+                "unresolved_sid_ratio": float(candidate.get("unresolved_sid_ratio", 1.0)),
+                "raw_model_response": str(candidate.get("raw_prediction", "")),
+            }
+        )
+
+    candidates_json = json.dumps(candidate_payload, ensure_ascii=False, indent=2)
+    return f"""你是一名推荐结果重排序评审器，需要根据给定 rubric 对整组候选推荐结果联合排序。
+
+规则：
+1. 必须联合比较整个候选池，而不是独立点评单个候选。
+2. 只能依据给定上下文和候选 item 的语义描述判断，不要依赖 SID 字符串本身。
+3. 如果某个候选缺少 caption 或语义不足，降低其置信度，不要自行脑补语义。
+4. `ranking` 必须覆盖全部候选，`candidate_index` 不能重复。
+5. `score` 范围必须是 [0, 1]，分数越高代表越应该排在前面。
+6. `reason` 和 `judge_reason` 必须尽量短，每条不超过 20 个字。
+7. 返回纯 JSON，不要附加说明。
+
+schema_id:
+{schema_id}
+
+rubric:
+{rubric_json}
+
+context:
+{context_json}
+
+candidates:
+{candidates_json}
+
+返回格式：
+{{
+  "ranking": [
+    {{
+      "candidate_index": 1,
+      "score": 0.82,
+      "reason": "..."
+    }}
+  ],
   "judge_reason": "..."
 }}
 """
@@ -602,6 +678,90 @@ def parse_judge_response(raw_response: str, rubric: list[dict[str, Any]]) -> Jud
         if judge_reason_match:
             judge_reason = judge_reason_match.group(1)
     return JudgeResult(rubric_score=rubric_score, criterion_results=normalized_results, judge_reason=judge_reason)
+
+
+def parse_listwise_judge_response(raw_response: str, candidate_count: int) -> ListwiseJudgeResult:
+    response = raw_response.strip()
+    if response.startswith("```json"):
+        response = response[7:]
+    elif response.startswith("```"):
+        response = response[3:]
+    if response.endswith("```"):
+        response = response[:-3]
+
+    parsed = parse_json_like(response, default=None)
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_ranking = parsed.get("ranking", [])
+    if not isinstance(raw_ranking, list):
+        raw_ranking = []
+
+    normalized_ranking: list[dict[str, Any]] = []
+    seen_indices: set[int] = set()
+    for entry in raw_ranking:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            candidate_index = int(entry.get("candidate_index"))
+        except (TypeError, ValueError):
+            continue
+        if candidate_index < 1 or candidate_index > candidate_count or candidate_index in seen_indices:
+            continue
+        score = entry.get("score")
+        try:
+            normalized_score = float(score)
+        except (TypeError, ValueError):
+            normalized_score = max(0.0, 1.0 - ((len(normalized_ranking)) / max(candidate_count, 1)))
+        normalized_ranking.append(
+            {
+                "candidate_index": candidate_index,
+                "score": max(0.0, min(1.0, normalized_score)),
+                "reason": str(entry.get("reason", "")),
+            }
+        )
+        seen_indices.add(candidate_index)
+
+    if not normalized_ranking:
+        recovered_entries = re.findall(
+            r'"candidate_index"\s*:\s*(\d+)(?:[^{}]*?"score"\s*:\s*([0-9]*\.?[0-9]+))?(?:[^{}]*?"reason"\s*:\s*"([^"]*)")?',
+            response,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for raw_index, raw_score, raw_reason in recovered_entries:
+            candidate_index = int(raw_index)
+            if candidate_index < 1 or candidate_index > candidate_count or candidate_index in seen_indices:
+                continue
+            try:
+                normalized_score = float(raw_score)
+            except (TypeError, ValueError):
+                normalized_score = max(0.0, 1.0 - (len(normalized_ranking) / max(candidate_count, 1)))
+            normalized_ranking.append(
+                {
+                    "candidate_index": candidate_index,
+                    "score": max(0.0, min(1.0, normalized_score)),
+                    "reason": str(raw_reason or ""),
+                }
+            )
+            seen_indices.add(candidate_index)
+
+    for candidate_index in range(1, candidate_count + 1):
+        if candidate_index in seen_indices:
+            continue
+        normalized_ranking.append(
+            {
+                "candidate_index": candidate_index,
+                "score": max(0.0, 1.0 - (len(normalized_ranking) / max(candidate_count, 1))),
+                "reason": "",
+            }
+        )
+
+    judge_reason = str(parsed.get("judge_reason", ""))
+    if not judge_reason:
+        judge_reason_match = re.search(r'"judge_reason"\s*:\s*"([^"]*)"', response, flags=re.IGNORECASE)
+        if judge_reason_match:
+            judge_reason = judge_reason_match.group(1)
+    return ListwiseJudgeResult(ranking=normalized_ranking, judge_reason=judge_reason)
 
 
 def majority_vote_judge_results(results: list[JudgeResult], rubric: list[dict[str, Any]]) -> JudgeResult:
@@ -698,13 +858,32 @@ def _cache_key(schema_id: str, extra_info: dict[str, Any], normalized_prediction
             "history_item_captions": extra_info.get("history_item_captions", []),
             "history_ad_captions": extra_info.get("history_ad_captions", []),
             "history_product_captions": extra_info.get("history_product_captions", []),
-            "ground_truth_captions": extra_info.get("ground_truth_captions", []),
         },
         ensure_ascii=False,
         sort_keys=True,
     )
     prompt_hash = sha256(prompt_hash_payload.encode("utf-8")).hexdigest()
     return f"{schema_id}:{prompt_hash}:{sha256(normalized_prediction.encode('utf-8')).hexdigest()}"
+
+
+def _listwise_cache_key(schema_id: str, extra_info: dict[str, Any], normalized_predictions: list[str]) -> str:
+    prompt_hash_payload = json.dumps(
+        {
+            "schema_id": schema_id,
+            "prompt_text": extra_info.get("prompt_text", ""),
+            "query_text": extra_info.get("query_text", ""),
+            "interaction_type": extra_info.get("interaction_type", ""),
+            "history_item_captions": extra_info.get("history_item_captions", []),
+            "history_ad_captions": extra_info.get("history_ad_captions", []),
+            "history_product_captions": extra_info.get("history_product_captions", []),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    ranking_hash_payload = json.dumps(normalized_predictions, ensure_ascii=False, sort_keys=False)
+    prompt_hash = sha256(prompt_hash_payload.encode("utf-8")).hexdigest()
+    ranking_hash = sha256(ranking_hash_payload.encode("utf-8")).hexdigest()
+    return f"listwise:{schema_id}:{prompt_hash}:{ranking_hash}"
 
 
 def _compute_rubric_score_for_sample(
@@ -787,6 +966,149 @@ def _compute_rubric_score_for_sample(
     if cache is not None:
         cache.set(cache_key, rubric_payload)
     return rubric_payload
+
+
+def compute_listwise_rubric_rerank(
+    predictions: list[str],
+    extra_info: dict[str, Any] | None,
+    *,
+    judge_base_url: str | None = None,
+    judge_model: str | None = None,
+    rubric_dir: str | None = None,
+    sidecar_lookup: dict[str, dict[str, Any]] | None = None,
+    cache_path: str | None = None,
+    timeout_s: int = 30,
+    judge_backend: str = "auto",
+    judge_max_new_tokens: int = 768,
+    judge_device_map: str = "auto",
+    judge_torch_dtype: str = "bfloat16",
+    judge_attn_implementation: str | None = None,
+    judge_impl: Any = None,
+) -> dict[str, Any]:
+    extra_info = parse_json_like(extra_info, default={})
+    sidecar_lookup = sidecar_lookup or {}
+    schema_id = str(extra_info.get("schema_id") or extra_info.get("task_name") or "unknown")
+    rubric = load_rubric(schema_id, rubric_dir)
+
+    candidate_states: list[dict[str, Any]] = []
+    normalized_predictions: list[str] = []
+    for index, prediction in enumerate(predictions, start=1):
+        predicted_items, unresolved_sid_ratio = resolve_predicted_items(prediction, sidecar_lookup)
+        normalized_predictions.append(normalize_prediction(prediction))
+        candidate_states.append(
+            {
+                "candidate_index": index,
+                "raw_rank": index,
+                "raw_prediction": prediction,
+                "predicted_items": predicted_items,
+                "predicted_pid": predicted_items[0].get("pid") if predicted_items else None,
+                "unresolved_sid_ratio": unresolved_sid_ratio,
+            }
+        )
+
+    cache_key = _listwise_cache_key(schema_id=schema_id, extra_info=extra_info, normalized_predictions=normalized_predictions)
+    cache = get_sqlite_cache(cache_path)
+    cached_value = cache.get(cache_key) if cache is not None else None
+    if isinstance(cached_value, dict) and isinstance(cached_value.get("ranking"), list):
+        listwise_result = ListwiseJudgeResult(
+            ranking=list(cached_value.get("ranking", [])),
+            judge_reason=str(cached_value.get("judge_reason", "")),
+        )
+        cache_hit = 1.0
+    else:
+        cache_hit = 0.0
+        if judge_impl is None:
+            judge_impl = get_judge_client(
+                judge_base_url,
+                judge_model,
+                timeout_s,
+                judge_backend=judge_backend,
+                judge_max_new_tokens=judge_max_new_tokens,
+                judge_device_map=judge_device_map,
+                judge_torch_dtype=judge_torch_dtype,
+                judge_attn_implementation=judge_attn_implementation,
+            )
+
+        if judge_impl is None:
+            listwise_result = ListwiseJudgeResult(
+                ranking=[
+                    {
+                        "candidate_index": candidate["candidate_index"],
+                        "score": max(0.0, 1.0 - ((candidate["candidate_index"] - 1) / max(len(candidate_states), 1))),
+                        "reason": "",
+                    }
+                    for candidate in candidate_states
+                ],
+                judge_reason="judge unavailable",
+            )
+            rubric_applied = 0.0
+            judge_prompt = ""
+            raw_response = ""
+        else:
+            judge_prompt = build_listwise_judge_prompt(
+                schema_id=schema_id,
+                rubric=rubric,
+                extra_info=extra_info,
+                candidates=candidate_states,
+            )
+            raw_response = _judge_generate(judge_impl, judge_prompt)
+            listwise_result = parse_listwise_judge_response(raw_response, len(candidate_states))
+            rubric_applied = 1.0
+            if cache is not None:
+                cache.set(
+                    cache_key,
+                    {
+                        "ranking": listwise_result.ranking,
+                        "judge_reason": listwise_result.judge_reason,
+                        "rubric_applied": rubric_applied,
+                    },
+                )
+
+    if cache_hit >= 1.0:
+        rubric_applied = float(cached_value.get("rubric_applied", 1.0))
+        judge_prompt = ""
+        raw_response = ""
+
+    ranking_lookup = {
+        int(entry.get("candidate_index", 0)): {
+            "listwise_rank": rank,
+            "rubric_score": max(0.0, min(1.0, float(entry.get("score", 0.0)))),
+            "judge_reason": str(entry.get("reason", "")),
+        }
+        for rank, entry in enumerate(listwise_result.ranking, start=1)
+        if 1 <= int(entry.get("candidate_index", 0)) <= len(candidate_states)
+    }
+
+    scored_candidates: list[dict[str, Any]] = []
+    for candidate in candidate_states:
+        ranking_entry = ranking_lookup.get(candidate["candidate_index"], {})
+        listwise_rank = int(ranking_entry.get("listwise_rank", candidate["candidate_index"]))
+        rubric_score = float(ranking_entry.get("rubric_score", max(0.0, 1.0 - ((listwise_rank - 1) / max(len(candidate_states), 1)))))
+        scored_candidates.append(
+            {
+                "output": candidate["raw_prediction"],
+                "raw_rank": candidate["raw_rank"],
+                "predicted_pid": candidate["predicted_pid"],
+                "predicted_items": candidate["predicted_items"],
+                "rubric_score": rubric_score,
+                "judge_reason": str(ranking_entry.get("judge_reason", "")),
+                "unresolved_sid_ratio": float(candidate["unresolved_sid_ratio"]),
+                "cache_hit": cache_hit,
+                "rubric_applied": rubric_applied,
+                "listwise_rank": listwise_rank,
+            }
+        )
+
+    return {
+        "schema_id": schema_id,
+        "rubric": rubric,
+        "candidates": scored_candidates,
+        "judge_prompt": judge_prompt,
+        "judge_response": raw_response,
+        "judge_reason": listwise_result.judge_reason,
+        "cache_hit": cache_hit,
+        "rubric_applied": rubric_applied,
+    }
 
 
 def compute_single_score(
