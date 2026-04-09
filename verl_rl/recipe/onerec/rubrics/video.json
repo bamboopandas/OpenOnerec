@@ -1,0 +1,34 @@
+[
+  {
+    "rule_id": "history_topic_match",
+    "rule_text": "优先选择与用户最近观看主题更连贯的候选。",
+    "evidence_source": ["history_item_captions", "candidate_caption"],
+    "decision_rule": "比较候选 A 和 B 与最近观看主题的贴近程度，更贴近者胜。",
+    "tie_condition": "若 A 和 B 在该方面证据都弱或差异不明显，则 tie。",
+    "weight": 3
+  },
+  {
+    "rule_id": "query_intent_match",
+    "rule_text": "优先选择符合用户当前查询意图的候选。",
+    "evidence_source": ["query_text", "candidate_caption"],
+    "decision_rule": "比较候选 A 和 B 是否符合用户当前查询意图，更符合者胜。",
+    "tie_condition": "若 A 和 B 在该方面证据都弱或差异不明显，则 tie。",
+    "weight": 2
+  },
+  {
+    "rule_id": "novelty_without_drift",
+    "rule_text": "优先选择新颖且与历史观看序列无显著偏离的候选。",
+    "evidence_source": ["history_item_captions", "candidate_caption"],
+    "decision_rule": "比较候选 A 和 B 的新颖性和与历史观看序列的偏离程度，更新颖且偏离较小者胜。",
+    "tie_condition": "若 A 和 B 在该方面证据都弱或差异不明显，则 tie。",
+    "weight": 2
+  },
+  {
+    "rule_id": "duplicate_penalty",
+    "rule_text": "避免重复推荐相同类型的候选。",
+    "evidence_source": ["candidate_caption"],
+    "decision_rule": "比较候选 A 和 B 是否更像重复已有候选池中的内容，更不重复者胜。",
+    "tie_condition": "若 A 和 B 都没有明显重复，或重复程度接近，则 tie。",
+    "weight": 1
+  }
+]

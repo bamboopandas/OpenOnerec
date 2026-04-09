@@ -79,6 +79,16 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
+def _judge_prompt_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        _sample_sort_key(record),
+        int(record.get("left_raw_rank", record.get("raw_rank", 0))),
+        int(record.get("right_raw_rank", 0)),
+        int(bool(record.get("swap", False))),
+        int(record.get("comparison_id", 0)),
+    )
+
+
 def main() -> None:
     args = parse_args()
     shard_dirs = [Path(item) for item in args.shard_dirs]
@@ -102,7 +112,7 @@ def main() -> None:
 
     candidate_pool_records.sort(key=_sample_sort_key)
     details.sort(key=_sample_sort_key)
-    judge_prompts.sort(key=lambda record: (_sample_sort_key(record), int(record.get("raw_rank", 0))))
+    judge_prompts.sort(key=_judge_prompt_sort_key)
 
     summary = summarize_candidate_pool_records(
         candidate_pool_records,

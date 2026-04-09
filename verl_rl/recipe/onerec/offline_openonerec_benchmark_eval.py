@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - optional dependency in local envs
 
 from recipe.onerec.evaluate_beauty_proxy import evaluate_groups
 from recipe.onerec.rubric_reward import (
-    compute_listwise_rubric_rerank,
+    compute_pairwise_rubric_rerank,
     extract_sid_blocks as extract_candidate_sid_blocks,
     get_offline_hf_judge_client,
     load_sidecar_index,
@@ -54,9 +54,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generation_file", required=True, help="Path to benchmark test_generated.json")
     parser.add_argument("--task_name", required=True, choices=["video", "ad", "product", "interactive", "label_cond"])
     parser.add_argument("--task_data_file", required=True, help="Path to the corresponding task parquet")
+    parser.add_argument("--preference_task_data_file", default="", help="Optional parquet that contains richer user preference summaries aligned by uuid")
     parser.add_argument("--output_dir", required=True, help="Directory for summary/details/prompts")
     parser.add_argument("--rubric_dir", required=True, help="Rubric directory")
     parser.add_argument("--judge_model_path", required=True, help="Local offline judge model")
+    parser.add_argument(
+        "--history_summary_model_path",
+        default="",
+        help="Optional local model used only for history summary generation; defaults to judge_model_path",
+    )
+    parser.add_argument("--adaptive_rules_file", default="", help="Optional JSONL keyed by sample_id/uuid that provides per-sample adaptive rules")
     parser.add_argument("--sidecar_index_path", default="", help="Optional existing sidecar parquet/json")
     parser.add_argument("--mapping_files", nargs="*", default=[], help="Mapping parquet files used to build sidecar if needed")
     parser.add_argument("--caption_files", nargs="*", default=[], help="Caption parquet files used to build sidecar if needed")
@@ -69,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device_map", default="auto", help="Transformers device_map for judge model")
     parser.add_argument("--torch_dtype", default="bfloat16", help="Torch dtype for judge model")
     parser.add_argument("--attn_implementation", default="none", help="Optional transformers attention implementation")
+    parser.add_argument("--pairwise_top_n", type=int, default=8, help="Top-N raw candidates to rerank with pairwise swap aggregation")
+    parser.add_argument("--pairwise_raw_rank_anchor", type=float, default=0.15, help="Small raw-rank anchor mixed into pairwise scores")
+    parser.add_argument("--pairwise_judge_mode", choices=["multi_rule", "single_rule_audit"], default="multi_rule", help="Pairwise judge execution mode")
+    parser.add_argument("--single_rule_include_candidate_id", action="store_true", help="Expose candidate_id in single_rule_audit prompts to reproduce legacy v3 behavior")
     parser.add_argument("--coverage_ks", nargs="*", type=int, default=[10, 20, 50, 100], help="Pass@k values for raw candidate coverage")
     parser.add_argument("--shard_id", type=int, default=0, help="Zero-based shard id")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards")
@@ -424,6 +435,63 @@ def _schema_id(task_name: str, metadata: dict[str, Any]) -> str:
     return "label_cond"
 
 
+def _extract_preference_summary_text(user_text: str) -> str:
+    text = _strip_sid_blocks(user_text)
+    if not text:
+        return ""
+    summary_patterns = [
+        r"(用户当前的偏好涉及[^。！？]*[。！？]?)",
+        r"(当前偏好涉及[^。！？]*[。！？]?)",
+        r"(偏好涉及[^。！？]*[。！？]?)",
+    ]
+    for pattern in summary_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return _truncate_text(match.group(1), 96)
+    return ""
+
+
+def _build_preference_summary_lookup(preference_task_data_file: str) -> dict[str, str]:
+    if not preference_task_data_file:
+        return {}
+    preference_df = pd.read_parquet(preference_task_data_file)
+    lookup: dict[str, str] = {}
+    for row in preference_df.itertuples(index=False):
+        raw_metadata = getattr(row, "metadata", None)
+        metadata = _parse_json_like(raw_metadata, default={})
+        uuid = str(metadata.get("uuid", "")).strip()
+        if not uuid or uuid in lookup:
+            continue
+        messages = _clean_messages(_parse_json_like(getattr(row, "messages", None), default=[]))
+        user_text = " ".join(message["content"] for message in messages if message.get("role") == "user").strip()
+        preference_summary = _extract_preference_summary_text(user_text)
+        if preference_summary:
+            lookup[uuid] = preference_summary
+    return lookup
+
+
+def _load_adaptive_rules_lookup(path: str) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    if not path:
+        return {}, {}
+    sample_lookup: dict[str, list[dict[str, Any]]] = {}
+    uuid_lookup: dict[str, list[dict[str, Any]]] = {}
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            record = parse_json_like(line, default={})
+            if not isinstance(record, dict):
+                continue
+            rules = parse_json_like(record.get("rules"), default=record.get("rules", []))
+            if not isinstance(rules, list) or not rules:
+                continue
+            sample_id = str(record.get("sample_id", "")).strip()
+            uuid = str(record.get("uuid", "")).strip()
+            if sample_id:
+                sample_lookup[sample_id] = rules
+            if uuid:
+                uuid_lookup[uuid] = rules
+    return sample_lookup, uuid_lookup
+
+
 def _build_extra_info(
     task_name: str,
     row: pd.Series,
@@ -433,6 +501,7 @@ def _build_extra_info(
     sidecar_lookup: dict[str, dict[str, Any]],
     history_limit: int,
     caption_max_chars: int,
+    preference_summary_text: str = "",
 ) -> dict[str, Any]:
     del caption_max_chars
     messages = _clean_messages(_extract_messages(row))
@@ -475,6 +544,7 @@ def _build_extra_info(
         "history_item_captions": history_item_captions[:history_limit],
         "history_ad_captions": history_ad_captions[:history_limit],
         "history_product_captions": history_product_captions[:history_limit],
+        "preference_summary_text": preference_summary_text,
         "ground_truth_sids": ground_truth_sids[:history_limit],
         "ground_truth_pids": ground_truth_pids[:history_limit],
         "ground_truth_captions": ground_truth_captions[:history_limit],
@@ -520,7 +590,7 @@ def _collect_context_pids(task_df: pd.DataFrame, generation_samples: dict[str, A
     context_pids: set[Any] = set()
     for sample in generation_samples.values():
         metadata = parse_json_like(sample.get("metadata"), default={})
-        row = _get_task_row(task_df, metadata.get("row_index"))
+        row = _get_task_row(task_df, metadata.get("row_index"), metadata.get("uuid"))
         for column in (
             "hist_pid",
             "hist_longview",
@@ -537,28 +607,53 @@ def _collect_context_pids(task_df: pd.DataFrame, generation_samples: dict[str, A
     return context_pids
 
 
-def _get_task_row(task_df: pd.DataFrame, row_index: Any) -> pd.Series:
+def _get_uuid_lookup(task_df: pd.DataFrame) -> dict[str, int]:
+    cached_lookup = task_df.attrs.get("_uuid_lookup")
+    if isinstance(cached_lookup, dict):
+        return cached_lookup
+
+    uuid_lookup: dict[str, int] = {}
+    if "metadata" in task_df.columns:
+        for position, raw_metadata in enumerate(task_df["metadata"].tolist()):
+            metadata = _parse_json_like(raw_metadata, default={})
+            uuid = str(metadata.get("uuid", "")).strip()
+            if uuid and uuid not in uuid_lookup:
+                uuid_lookup[uuid] = position
+    task_df.attrs["_uuid_lookup"] = uuid_lookup
+    return uuid_lookup
+
+
+def _get_task_row(task_df: pd.DataFrame, row_index: Any, uuid: Any = None) -> pd.Series:
+    if row_index is not None:
+        try:
+            normalized_row_index = int(row_index)
+        except (TypeError, ValueError):
+            normalized_row_index = None
+        else:
+            if normalized_row_index in task_df.index:
+                row = task_df.loc[normalized_row_index]
+                if isinstance(row, pd.DataFrame):
+                    return row.iloc[0]
+                return row
+            if 0 <= normalized_row_index < len(task_df):
+                return task_df.iloc[normalized_row_index]
+
+    normalized_uuid = str(uuid or "").strip()
+    if normalized_uuid:
+        uuid_lookup = _get_uuid_lookup(task_df)
+        if normalized_uuid in uuid_lookup:
+            return task_df.iloc[int(uuid_lookup[normalized_uuid])]
+
     if row_index is None:
         raise KeyError("row_index is missing from generation metadata")
-    try:
-        normalized_row_index = int(row_index)
-    except (TypeError, ValueError) as exc:
-        raise KeyError(f"invalid row_index: {row_index}") from exc
-
-    if normalized_row_index in task_df.index:
-        row = task_df.loc[normalized_row_index]
-        if isinstance(row, pd.DataFrame):
-            return row.iloc[0]
-        return row
-    if 0 <= normalized_row_index < len(task_df):
-        return task_df.iloc[normalized_row_index]
-    raise KeyError(f"row_index {normalized_row_index} not found in task parquet")
+    raise KeyError(f"unable to locate task row: row_index={row_index}, uuid={normalized_uuid}")
 
 
 def _sort_candidates_by_rubric(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         candidates,
         key=lambda candidate: (
+            int(candidate.get("pairwise_rank", 10**9)),
             int(candidate.get("listwise_rank", 10**9)),
             -float(candidate.get("rubric_score", 0.0)),
             int(candidate.get("raw_rank", 0)),
@@ -656,6 +751,7 @@ def _score_samples(
     rubric_dir: str,
     sidecar_index_path: str,
     judge_model_path: str,
+    history_summary_model_path: str,
     cache_path: str,
     history_limit: int,
     caption_max_chars: int,
@@ -667,10 +763,17 @@ def _score_samples(
     caption_files: list[str],
     generation_file: str,
     task_data_file: str,
+    preference_summary_lookup: dict[str, str],
+    adaptive_rule_lookup_by_sample_id: dict[str, list[dict[str, Any]]],
+    adaptive_rule_lookup_by_uuid: dict[str, list[dict[str, Any]]],
     context_pids: set[Any],
     k: int,
     pass_ks: list[int],
     coverage_ks: list[int],
+    pairwise_top_n: int,
+    pairwise_raw_rank_anchor: float,
+    pairwise_judge_mode: str,
+    single_rule_include_candidate_id: bool = False,
 ) -> dict[str, Any]:
     logger.info("Loading sidecar lookup from %s", sidecar_index_path)
     started_at = time.perf_counter()
@@ -685,26 +788,66 @@ def _score_samples(
         allowed_pids=set(context_pids) | predicted_pids,
     )
     logger.info("Built pid-caption lookup with %d rows in %.2fs", len(pid_caption_lookup), time.perf_counter() - started_at)
-    logger.info("Initializing offline judge model from %s", judge_model_path)
-    started_at = time.perf_counter()
-    judge_impl = get_offline_hf_judge_client(
-        judge_model=judge_model_path,
-        max_new_tokens=judge_max_new_tokens,
-        device_map=device_map,
-        torch_dtype=torch_dtype,
-        attn_implementation=attn_implementation,
-    )
-    logger.info("Initialized offline judge model in %.2fs", time.perf_counter() - started_at)
+    judge_impl = None
+    history_summary_judge_impl = None
+    if str(judge_model_path).strip().lower() not in {"", "none", "null"}:
+        logger.info("Initializing offline judge model from %s", judge_model_path)
+        started_at = time.perf_counter()
+        judge_impl = get_offline_hf_judge_client(
+            judge_model=judge_model_path,
+            max_new_tokens=judge_max_new_tokens,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+        )
+        logger.info("Initialized offline judge model in %.2fs", time.perf_counter() - started_at)
+    else:
+        logger.info("Skipping offline judge initialization because judge_model_path=%s", judge_model_path)
+    normalized_history_summary_model_path = str(history_summary_model_path).strip()
+    if not normalized_history_summary_model_path:
+        normalized_history_summary_model_path = str(judge_model_path).strip()
+    if normalized_history_summary_model_path.lower() in {"", "none", "null"}:
+        logger.info(
+            "Skipping history summary model initialization because history_summary_model_path=%s",
+            normalized_history_summary_model_path,
+        )
+    elif normalized_history_summary_model_path == str(judge_model_path).strip():
+        history_summary_judge_impl = judge_impl
+    else:
+        logger.info("Initializing history summary model from %s", normalized_history_summary_model_path)
+        started_at = time.perf_counter()
+        history_summary_judge_impl = get_offline_hf_judge_client(
+            judge_model=normalized_history_summary_model_path,
+            max_new_tokens=judge_max_new_tokens,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+        )
+        logger.info("Initialized history summary model in %.2fs", time.perf_counter() - started_at)
 
     details: list[dict[str, Any]] = []
     candidate_pool_records: list[dict[str, Any]] = []
     judge_prompts: list[dict[str, Any]] = []
+    history_summary_records: list[dict[str, Any]] = []
+    single_rule_prompts: list[dict[str, Any]] = []
+    single_rule_outputs: list[dict[str, Any]] = []
+    single_rule_audit: list[dict[str, Any]] = []
     rubric_snapshot: dict[str, list[dict[str, Any]]] = {}
+    aggregate_audit_metrics = {
+        "expected_rule_calls": 0,
+        "completed_rule_calls": 0,
+        "retry_count": 0,
+        "forced_tie_count": 0,
+        "swap_consistent_rule_pairs": 0,
+        "total_rule_pairs": 0,
+        "history_summary_nonempty_count": 0,
+    }
 
     for sample_id, sample in generation_samples.items():
         metadata = parse_json_like(sample.get("metadata"), default={})
-        row = _get_task_row(task_df, metadata.get("row_index"))
+        row = _get_task_row(task_df, metadata.get("row_index"), metadata.get("uuid"))
         ground_truth = str(sample.get("ground_truth", ""))
+        preference_summary_text = str(preference_summary_lookup.get(str(metadata.get("uuid", "")).strip(), "")).strip()
         extra_info = _build_extra_info(
             task_name=task_name,
             row=row,
@@ -714,9 +857,15 @@ def _score_samples(
             sidecar_lookup=sidecar_lookup,
             history_limit=history_limit,
             caption_max_chars=caption_max_chars,
+            preference_summary_text=preference_summary_text,
         )
+        adaptive_rules = adaptive_rule_lookup_by_sample_id.get(str(sample_id), [])
+        if not adaptive_rules:
+            adaptive_rules = adaptive_rule_lookup_by_uuid.get(str(metadata.get("uuid", "")).strip(), [])
+        if adaptive_rules:
+            extra_info["adaptive_rules"] = adaptive_rules
         schema_id = str(extra_info.get("schema_id", task_name))
-        rerank_payload = compute_listwise_rubric_rerank(
+        rerank_payload = compute_pairwise_rubric_rerank(
             predictions=[str(output) for output in sample.get("generations", [])],
             extra_info=extra_info,
             rubric_dir=rubric_dir,
@@ -730,26 +879,92 @@ def _score_samples(
             judge_torch_dtype=torch_dtype,
             judge_attn_implementation=attn_implementation,
             judge_impl=judge_impl,
+            history_summary_judge_impl=history_summary_judge_impl,
+            pairwise_top_n=pairwise_top_n,
+            pairwise_raw_rank_anchor=pairwise_raw_rank_anchor,
+            pairwise_judge_mode=pairwise_judge_mode,
+            single_rule_include_candidate_id=single_rule_include_candidate_id,
         )
-        rubric_snapshot[schema_id] = rerank_payload["rubric"]
+        rubric_snapshot_key = f"{schema_id}::{sample_id}" if extra_info.get("adaptive_rules") else schema_id
+        rubric_snapshot[rubric_snapshot_key] = rerank_payload["rubric"]
         raw_candidates = rerank_payload["candidates"]
         reranked_candidates = _sort_candidates_by_rubric(raw_candidates)
+        history_summary_record = dict(rerank_payload.get("history_summary_record", {}))
+        if history_summary_record:
+            history_summary_records.append(
+                {
+                    "sample_id": sample_id,
+                    "uuid": metadata.get("uuid", ""),
+                    "task_name": task_name,
+                    **history_summary_record,
+                }
+            )
 
-        judge_prompts.append(
-            {
-                "sample_id": sample_id,
-                "uuid": metadata.get("uuid", ""),
-                "task_name": task_name,
-                "schema_id": schema_id,
-                "candidate_count": len(raw_candidates),
-                "judge_prompt": rerank_payload["judge_prompt"],
-                "judge_response": rerank_payload["judge_response"],
-                "judge_reason": rerank_payload["judge_reason"],
-                "cache_hit": float(rerank_payload["cache_hit"]),
-                "rubric_applied": float(rerank_payload["rubric_applied"]),
-                "rubric": rerank_payload["rubric"],
-            }
-        )
+        audit_metrics = dict(rerank_payload.get("audit_metrics", {}))
+        aggregate_audit_metrics["expected_rule_calls"] += int(audit_metrics.get("expected_rule_calls", 0))
+        aggregate_audit_metrics["completed_rule_calls"] += int(audit_metrics.get("completed_rule_calls", 0))
+        aggregate_audit_metrics["retry_count"] += int(audit_metrics.get("retry_count", 0))
+        aggregate_audit_metrics["forced_tie_count"] += int(audit_metrics.get("forced_tie_count", 0))
+        aggregate_audit_metrics["swap_consistent_rule_pairs"] += int(audit_metrics.get("swap_consistent_rule_pairs", 0))
+        aggregate_audit_metrics["total_rule_pairs"] += int(audit_metrics.get("total_rule_pairs", 0))
+        aggregate_audit_metrics["history_summary_nonempty_count"] += int(bool(audit_metrics.get("history_summary_nonempty", False)))
+
+        for comparison_id, pair_record in enumerate(rerank_payload.get("pairwise_judgments", []), start=1):
+            judge_prompts.append(
+                {
+                    "sample_id": sample_id,
+                    "uuid": metadata.get("uuid", ""),
+                    "task_name": task_name,
+                    "schema_id": schema_id,
+                    "comparison_id": comparison_id,
+                    "left_candidate_index": int(pair_record.get("left_candidate_index", 0)),
+                    "right_candidate_index": int(pair_record.get("right_candidate_index", 0)),
+                    "left_raw_rank": int(pair_record.get("left_raw_rank", 0)),
+                    "right_raw_rank": int(pair_record.get("right_raw_rank", 0)),
+                    "swap": bool(pair_record.get("swap", False)),
+                    "winner": str(pair_record.get("winner", "")),
+                    "confidence": float(pair_record.get("confidence", 0.0)),
+                    "judge_prompt": pair_record.get("judge_prompt", ""),
+                    "judge_response": pair_record.get("judge_response", ""),
+                    "judge_reason": pair_record.get("judge_reason", ""),
+                    "cache_hit": float(pair_record.get("cache_hit", 0.0)),
+                    "rubric_applied": float(pair_record.get("rubric_applied", 0.0)),
+                    "aggregated_margin": float(pair_record.get("aggregated_margin", 0.0)),
+                    "criterion_votes": list(pair_record.get("criterion_votes", [])),
+                    "rubric": rerank_payload["rubric"],
+                    "typed_criteria": rerank_payload.get("typed_criteria", []),
+                    "rule_source": "adaptive_rules" if extra_info.get("adaptive_rules") else "shared_rules",
+                    "pairwise_judge_mode": pairwise_judge_mode,
+                }
+            )
+
+        for record in rerank_payload.get("single_rule_prompts", []):
+            single_rule_prompts.append(
+                {
+                    "sample_id": sample_id,
+                    "uuid": metadata.get("uuid", ""),
+                    "task_name": task_name,
+                    **record,
+                }
+            )
+        for record in rerank_payload.get("single_rule_outputs", []):
+            single_rule_outputs.append(
+                {
+                    "sample_id": sample_id,
+                    "uuid": metadata.get("uuid", ""),
+                    "task_name": task_name,
+                    **record,
+                }
+            )
+        for record in rerank_payload.get("single_rule_audit", []):
+            single_rule_audit.append(
+                {
+                    "sample_id": sample_id,
+                    "uuid": metadata.get("uuid", ""),
+                    "task_name": task_name,
+                    **record,
+                }
+            )
 
         candidate_pool_records.append(
             {
@@ -761,6 +976,10 @@ def _score_samples(
                 "ground_truth_pids": extra_info.get("ground_truth_pids", []),
                 "extra_info": extra_info,
                 "candidates": raw_candidates,
+                "pairwise_top_n": int(rerank_payload.get("pairwise_top_n", pairwise_top_n)),
+                "pairwise_raw_rank_anchor": float(rerank_payload.get("pairwise_raw_rank_anchor", pairwise_raw_rank_anchor)),
+                "rule_source": "adaptive_rules" if extra_info.get("adaptive_rules") else "shared_rules",
+                "pairwise_judge_mode": pairwise_judge_mode,
             }
         )
         details.append(
@@ -771,10 +990,17 @@ def _score_samples(
                 "extra_info": extra_info,
                 "ground_truth": ground_truth,
                 "prompt": sample.get("prompt", ""),
-                "listwise_judge": {
+                "pairwise_judge": {
                     "judge_reason": rerank_payload["judge_reason"],
                     "cache_hit": float(rerank_payload["cache_hit"]),
                     "rubric_applied": float(rerank_payload["rubric_applied"]),
+                    "pairwise_top_n": int(rerank_payload.get("pairwise_top_n", pairwise_top_n)),
+                    "pairwise_raw_rank_anchor": float(rerank_payload.get("pairwise_raw_rank_anchor", pairwise_raw_rank_anchor)),
+                    "num_comparisons": len(rerank_payload.get("pairwise_judgments", [])),
+                    "typed_criteria": rerank_payload.get("typed_criteria", []),
+                    "rule_source": "adaptive_rules" if extra_info.get("adaptive_rules") else "shared_rules",
+                    "pairwise_judge_mode": pairwise_judge_mode,
+                    "audit_metrics": audit_metrics,
                 },
                 "raw_ranking": raw_candidates,
                 "rubric_rerank": [
@@ -795,12 +1021,40 @@ def _score_samples(
     with (output_dir / "judge_prompts.jsonl").open("w", encoding="utf-8") as handle:
         for record in judge_prompts:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with (output_dir / "history_summary.jsonl").open("w", encoding="utf-8") as handle:
+        for record in history_summary_records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with (output_dir / "single_rule_prompts.jsonl").open("w", encoding="utf-8") as handle:
+        for record in single_rule_prompts:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with (output_dir / "single_rule_outputs.jsonl").open("w", encoding="utf-8") as handle:
+        for record in single_rule_outputs:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with (output_dir / "single_rule_audit.jsonl").open("w", encoding="utf-8") as handle:
+        for record in single_rule_audit:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     summary = summarize_candidate_pool_records(
         candidate_pool_records,
         k=k,
         pass_ks=pass_ks,
         coverage_ks=coverage_ks,
+    )
+    expected_rule_calls = max(int(aggregate_audit_metrics["expected_rule_calls"]), 0)
+    total_rule_pairs = max(int(aggregate_audit_metrics["total_rule_pairs"]), 0)
+    num_total_examples = max(len(candidate_pool_records), 1)
+    summary.update(
+        {
+            "rule_completion_rate": (
+                float(aggregate_audit_metrics["completed_rule_calls"]) / expected_rule_calls if expected_rule_calls > 0 else 0.0
+            ),
+            "retry_rate": float(aggregate_audit_metrics["retry_count"]) / expected_rule_calls if expected_rule_calls > 0 else 0.0,
+            "forced_tie_rate": float(aggregate_audit_metrics["forced_tie_count"]) / expected_rule_calls if expected_rule_calls > 0 else 0.0,
+            "swap_consistency_rate": (
+                float(aggregate_audit_metrics["swap_consistent_rule_pairs"]) / total_rule_pairs if total_rule_pairs > 0 else 0.0
+            ),
+            "history_summary_nonempty_rate": float(aggregate_audit_metrics["history_summary_nonempty_count"]) / num_total_examples,
+        }
     )
 
     return {
@@ -809,7 +1063,12 @@ def _score_samples(
         "generation_file": str(Path(generation_file).resolve()),
         "task_data_file": str(Path(task_data_file).resolve()),
         "judge_model_path": judge_model_path,
+        "history_summary_model_path": history_summary_model_path or judge_model_path,
         "sidecar_index_path": sidecar_index_path,
+        "pairwise_top_n": pairwise_top_n,
+        "pairwise_raw_rank_anchor": pairwise_raw_rank_anchor,
+        "pairwise_judge_mode": pairwise_judge_mode,
+        "single_rule_include_candidate_id": bool(single_rule_include_candidate_id),
     }
 
 
@@ -826,6 +1085,8 @@ def main() -> None:
         num_shards=args.num_shards,
     )
     task_df = pd.read_parquet(args.task_data_file)
+    preference_summary_lookup = _build_preference_summary_lookup(args.preference_task_data_file)
+    adaptive_rule_lookup_by_sample_id, adaptive_rule_lookup_by_uuid = _load_adaptive_rules_lookup(args.adaptive_rules_file)
     context_pids = _collect_context_pids(task_df, generation_samples)
 
     sidecar_index_path = _ensure_sidecar_index(
@@ -843,6 +1104,7 @@ def main() -> None:
         rubric_dir=args.rubric_dir,
         sidecar_index_path=sidecar_index_path,
         judge_model_path=args.judge_model_path,
+        history_summary_model_path=args.history_summary_model_path,
         cache_path=cache_path,
         history_limit=args.history_limit,
         caption_max_chars=args.caption_max_chars,
@@ -854,15 +1116,26 @@ def main() -> None:
         caption_files=args.caption_files,
         generation_file=args.generation_file,
         task_data_file=args.task_data_file,
+        preference_summary_lookup=preference_summary_lookup,
+        adaptive_rule_lookup_by_sample_id=adaptive_rule_lookup_by_sample_id,
+        adaptive_rule_lookup_by_uuid=adaptive_rule_lookup_by_uuid,
         context_pids=context_pids,
         k=args.k,
         pass_ks=args.pass_ks,
         coverage_ks=args.coverage_ks,
+        pairwise_top_n=args.pairwise_top_n,
+        pairwise_raw_rank_anchor=args.pairwise_raw_rank_anchor,
+        pairwise_judge_mode=args.pairwise_judge_mode,
+        single_rule_include_candidate_id=args.single_rule_include_candidate_id,
     )
     summary["model_name"] = model_name
     summary["k"] = args.k
     summary["pass_ks"] = list(args.pass_ks)
     summary["coverage_ks"] = list(args.coverage_ks)
+    summary["pairwise_top_n"] = args.pairwise_top_n
+    summary["pairwise_raw_rank_anchor"] = args.pairwise_raw_rank_anchor
+    summary["pairwise_judge_mode"] = args.pairwise_judge_mode
+    summary["single_rule_include_candidate_id"] = bool(args.single_rule_include_candidate_id)
     summary["shard_id"] = args.shard_id
     summary["num_shards"] = args.num_shards
 
